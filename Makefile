@@ -1,7 +1,6 @@
 BINARY := snout
 BUILD_DIR := build
 
-
 .PHONY: all build clean run
 
 all: build
@@ -11,7 +10,7 @@ build:
 	go build -o $(BUILD_DIR)/$(BINARY) ./cmd/snout
 
 run: build
-	./$(BUILD_DIR)/$(BINARY)
+	./$(BUILD_DIR)/$(BINARY) -f
 
 clean:
 	rm -rf $(BUILD_DIR)

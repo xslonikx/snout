@@ -1,0 +1,5 @@
+gobgp_grpc_socket = "127.0.0.1:50051"
+log_level = "info"
+syslog_facility = "local0"
+bridge_list = ["br0"]
+bridge_scan_interval = "5s"

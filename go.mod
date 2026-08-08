@@ -4,6 +4,7 @@ go 1.26.5
 
 require (
 	github.com/osrg/gobgp/v4 v4.7.0
+	github.com/pelletier/go-toml/v2 v2.2.3
 	google.golang.org/grpc v1.79.3
 )
 

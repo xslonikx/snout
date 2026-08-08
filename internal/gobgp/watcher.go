@@ -5,32 +5,46 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"sync"
 
 	api "github.com/osrg/gobgp/v4/api"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/xslonikx/snout/internal/event"
+	"github.com/xslonikx/snout/internal/logging"
 )
 
-// Run connects to GoBGP and starts independent EVPN table and peer-state
-// streams. Protobuf values do not cross the internal/gobgp package boundary.
-func Run(ctx context.Context, address string, routeEvents chan<- event.RouteEvent, peerEvents chan<- event.PeerEvent) error {
+type Client struct {
+	conn            *grpc.ClientConn
+	client          api.GoBgpServiceClient
+	mu              sync.Mutex
+	paths           map[string][]byte
+	publisherConfig PublisherConfig
+}
+
+func NewClient(address string) (*Client, error) {
 	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return fmt.Errorf("create GoBGP gRPC connection: %w", err)
+		return nil, fmt.Errorf("create GoBGP gRPC connection: %w", err)
 	}
-	defer conn.Close()
+	return &Client{conn: conn, client: api.NewGoBgpServiceClient(conn), paths: make(map[string][]byte)}, nil
+}
 
-	client := api.NewGoBgpServiceClient(conn)
+func (c *Client) Close() error {
+	return c.conn.Close()
+}
+
+// Watch starts independent EVPN table and peer-state streams. Protobuf values
+// do not cross the internal/gobgp package boundary.
+func (c *Client) Watch(ctx context.Context, routeEvents chan<- event.RouteEvent, peerEvents chan<- event.PeerEvent) error {
 	errs := make(chan error, 2)
 
 	go func() {
-		errs <- watchTable(ctx, client, routeEvents)
+		errs <- watchTable(ctx, c.client, routeEvents)
 	}()
 	go func() {
-		errs <- watchPeers(ctx, client, peerEvents)
+		errs <- watchPeers(ctx, c.client, peerEvents)
 	}()
 
 	select {
@@ -73,7 +87,7 @@ func watchTable(ctx context.Context, client api.GoBgpServiceClient, events chan<
 		for _, path := range table.GetPaths() {
 			routeEvent, err := DecodeRoute(path)
 			if err != nil {
-				log.Printf("skip EVPN path: %v", err)
+				logging.Warningf("skip EVPN path: %v", err)
 				continue
 			}
 
@@ -111,7 +125,7 @@ func watchPeers(ctx context.Context, client api.GoBgpServiceClient, events chan<
 
 		decodedEvent, err := DecodePeer(peerEvent)
 		if err != nil {
-			log.Printf("skip peer event: %v", err)
+			logging.Warningf("skip peer event: %v", err)
 			continue
 		}
 		if decodedEvent == nil {
