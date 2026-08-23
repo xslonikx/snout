@@ -38,3 +38,5 @@ Optional settings:
 Remote EVPN routes create a VXLAN port for their VNI/VTEP and install a static FDB entry. Local non-VXLAN FDB entries are announced through GoBGP; when an entry disappears, its path is withdrawn.
 
 Static FDB programming uses the `fdb/add` and `fdb/del` commands available in Open vSwitch 2.17 and newer.
+
+The minimum requirements for BUM forwarding are documented in [`docs/minimal-bum.md`](docs/minimal-bum.md). The planned flow-based VXLAN/OpenFlow implementation is tracked in [`TODO.md`](TODO.md).
