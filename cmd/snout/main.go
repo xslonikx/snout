@@ -67,6 +67,7 @@ func run(appConfig config.Config) error {
 	defer cancel()
 
 	routeEvents := make(chan event.RouteEvent, eventQueueSize)
+	imetEvents := make(chan event.IMETEvent, eventQueueSize)
 	peerEvents := make(chan event.PeerEvent, eventQueueSize)
 	bus := event.NewEventBus()
 	stdout := stdoutconsumer.Consumer{}
@@ -97,14 +98,15 @@ func run(appConfig config.Config) error {
 	}
 
 	go bus.RunRouteQueue(ctx, routeEvents)
+	go bus.RunIMETQueue(ctx, imetEvents)
 	go bus.RunPeerQueue(ctx, peerEvents)
 	if manager == nil {
-		return bgpClient.Watch(ctx, routeEvents, peerEvents)
+		return bgpClient.Watch(ctx, routeEvents, imetEvents, peerEvents)
 	}
 
 	errs := make(chan error, 2)
 	go func() {
-		errs <- bgpClient.Watch(ctx, routeEvents, peerEvents)
+		errs <- bgpClient.Watch(ctx, routeEvents, imetEvents, peerEvents)
 	}()
 	go func() {
 		errs <- manager.Run(ctx)

@@ -46,6 +46,23 @@ func (b *EventBus) RunRouteQueue(ctx context.Context, events <-chan RouteEvent) 
 	}
 }
 
+func (b *EventBus) RunIMETQueue(ctx context.Context, events <-chan IMETEvent) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case imetEvent, ok := <-events:
+			if !ok {
+				return
+			}
+
+			for _, consumer := range b.routeConsumers {
+				consumer.Consume(imetEvent)
+			}
+		}
+	}
+}
+
 func (b *EventBus) RunPeerQueue(ctx context.Context, events <-chan PeerEvent) {
 	for {
 		select {

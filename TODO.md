@@ -2,7 +2,8 @@
 
 ## BUM and multicast
 
-- [ ] Implement the minimal Type-3 IMET and fixed-port BUM behavior defined in [`docs/minimal-bum.md`](docs/minimal-bum.md).
+- [x] Implement Type-3 IMET publication/withdrawal, remote VTEP membership, fixed-port ingress replication, independent Type-2/Type-3 references, and protected-port split horizon as defined in [`docs/minimal-bum.md`](docs/minimal-bum.md).
+- [ ] Validate the minimum BUM integration scenarios in a multi-hypervisor lab, including ARP, unknown unicast, Ethernet multicast, split horizon, withdrawal, VNI isolation, and restart recovery.
 
 ## Flow-based VXLAN dataplane
 

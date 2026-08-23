@@ -3,6 +3,7 @@ package gobgp
 import (
 	"errors"
 	"fmt"
+	"net"
 
 	api "github.com/osrg/gobgp/v4/api"
 
@@ -33,6 +34,35 @@ func DecodeRoute(path *api.Path) (*event.RouteEvent, error) {
 	}
 
 	return &event.RouteEvent{Action: action, Route: route}, nil
+}
+
+func DecodeIMET(path *api.Path) (*event.IMETEvent, error) {
+	if path == nil {
+		return nil, errors.New("nil path")
+	}
+	imet := path.GetNlri().GetEvpnMulticast()
+	if imet == nil {
+		return nil, errors.New("unsupported NLRI: expected EVPN Inclusive Multicast Ethernet Tag route")
+	}
+	rd, err := formatRouteDistinguisher(imet.GetRd())
+	if err != nil {
+		return nil, fmt.Errorf("decode route distinguisher: %w", err)
+	}
+	vtep := imet.GetIpAddress()
+	if vtep == "" {
+		vtep, err = decodeVTEP(path.GetPattrs())
+		if err != nil {
+			return nil, err
+		}
+	}
+	if net.ParseIP(vtep) == nil {
+		return nil, fmt.Errorf("invalid IMET VTEP address %q", vtep)
+	}
+	action := event.RouteAdd
+	if path.GetIsWithdraw() {
+		action = event.RouteDelete
+	}
+	return &event.IMETEvent{Action: action, Route: event.IMETRoute{RD: rd, VNI: imet.GetEthernetTag(), VTEP: vtep}}, nil
 }
 
 func decodeEVPNNLRI(nlri *api.NLRI) (event.EVPNRoute, error) {

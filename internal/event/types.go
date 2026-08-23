@@ -26,6 +26,18 @@ type RouteEvent struct {
 	Route  EVPNRoute   `json:"route"`
 }
 
+// IMETRoute represents EVPN Type-3 membership of a VTEP in a VNI.
+type IMETRoute struct {
+	RD   string `json:"rd"`
+	VNI  uint32 `json:"vni"`
+	VTEP string `json:"vtep"`
+}
+
+type IMETEvent struct {
+	Action RouteAction `json:"action"`
+	Route  IMETRoute   `json:"route"`
+}
+
 type PeerEventType string
 
 const (

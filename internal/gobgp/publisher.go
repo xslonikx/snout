@@ -15,10 +15,48 @@ import (
 const (
 	extendedCommunityRouteTarget = 0x02
 	tunnelTypeVXLAN              = 8
+	pmsiTunnelIngressReplication = 6
 )
 
 type PublisherConfig struct {
 	RouteTarget string
+}
+
+func (c *Client) AnnounceIMET(ctx context.Context, route event.IMETRoute) error {
+	path, err := c.buildIMETPath(route)
+	if err != nil {
+		return err
+	}
+	response, err := c.client.AddPath(ctx, &api.AddPathRequest{TableType: api.TableType_TABLE_TYPE_GLOBAL, Path: path})
+	if err != nil {
+		return fmt.Errorf("add EVPN Type-3 path: %w", err)
+	}
+	c.mu.Lock()
+	c.paths[publishedIMETKey(route)] = append([]byte(nil), response.GetUuid()...)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *Client) WithdrawIMET(ctx context.Context, route event.IMETRoute) error {
+	key := publishedIMETKey(route)
+	c.mu.Lock()
+	uuid := append([]byte(nil), c.paths[key]...)
+	c.mu.Unlock()
+	request := &api.DeletePathRequest{TableType: api.TableType_TABLE_TYPE_GLOBAL, Family: evpnFamily(), Uuid: uuid}
+	if len(uuid) == 0 {
+		path, err := c.buildIMETPath(route)
+		if err != nil {
+			return err
+		}
+		request.Path = path
+	}
+	if _, err := c.client.DeletePath(ctx, request); err != nil {
+		return fmt.Errorf("delete EVPN Type-3 path: %w", err)
+	}
+	c.mu.Lock()
+	delete(c.paths, key)
+	c.mu.Unlock()
+	return nil
 }
 
 func (c *Client) SetPublisherConfig(config PublisherConfig) error {
@@ -99,11 +137,49 @@ func (c *Client) buildPath(route event.EVPNRoute) (*api.Path, error) {
 		Nlri:   nlri,
 		Pattrs: []*api.Attribute{
 			{Attr: &api.Attribute_Origin{Origin: &api.OriginAttribute{Origin: 0}}},
-			{Attr: &api.Attribute_MpReach{MpReach: &api.MpReachNLRIAttribute{Family: evpnFamily(), NextHops: []string{route.VTEP}}}},
+			{Attr: &api.Attribute_MpReach{MpReach: &api.MpReachNLRIAttribute{Family: evpnFamily(), NextHops: []string{route.VTEP}, Nlris: []*api.NLRI{nlri}}}},
 			{Attr: &api.Attribute_ExtendedCommunities{ExtendedCommunities: &api.ExtendedCommunitiesAttribute{Communities: []*api.ExtendedCommunity{
 				rt,
 				{Extcom: &api.ExtendedCommunity_Encap{Encap: &api.EncapExtended{TunnelType: tunnelTypeVXLAN}}},
 			}}}},
+		},
+	}, nil
+}
+
+func (c *Client) buildIMETPath(route event.IMETRoute) (*api.Path, error) {
+	if route.VNI == 0 || net.ParseIP(route.VTEP) == nil {
+		return nil, fmt.Errorf("IMET route must contain a valid VNI and VTEP")
+	}
+	rd, err := parseRD(route.RD)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	routeTarget := c.publisherConfig.RouteTarget
+	c.mu.Unlock()
+	rt, err := parseRouteTarget(routeTarget)
+	if err != nil {
+		return nil, err
+	}
+	vtep := net.ParseIP(route.VTEP)
+	id := vtep.To4()
+	if id == nil {
+		id = vtep.To16()
+	}
+	nlri := &api.NLRI{Nlri: &api.NLRI_EvpnMulticast{EvpnMulticast: &api.EVPNInclusiveMulticastEthernetTagRoute{
+		Rd: rd, EthernetTag: route.VNI, IpAddress: route.VTEP,
+	}}}
+	return &api.Path{
+		Family: evpnFamily(),
+		Nlri:   nlri,
+		Pattrs: []*api.Attribute{
+			{Attr: &api.Attribute_Origin{Origin: &api.OriginAttribute{Origin: 0}}},
+			{Attr: &api.Attribute_MpReach{MpReach: &api.MpReachNLRIAttribute{Family: evpnFamily(), NextHops: []string{route.VTEP}, Nlris: []*api.NLRI{nlri}}}},
+			{Attr: &api.Attribute_ExtendedCommunities{ExtendedCommunities: &api.ExtendedCommunitiesAttribute{Communities: []*api.ExtendedCommunity{
+				rt,
+				{Extcom: &api.ExtendedCommunity_Encap{Encap: &api.EncapExtended{TunnelType: tunnelTypeVXLAN}}},
+			}}}},
+			{Attr: &api.Attribute_PmsiTunnel{PmsiTunnel: &api.PmsiTunnelAttribute{Type: pmsiTunnelIngressReplication, Label: route.VNI, Id: id}}},
 		},
 	}, nil
 }
@@ -167,5 +243,9 @@ func evpnFamily() *api.Family {
 }
 
 func publishedRouteKey(route event.EVPNRoute) string {
-	return fmt.Sprintf("%s/%d/%s/%s", route.RD, route.VNI, strings.ToLower(route.MAC), route.IP)
+	return fmt.Sprintf("type2/%s/%d/%s/%s", route.RD, route.VNI, strings.ToLower(route.MAC), route.IP)
+}
+
+func publishedIMETKey(route event.IMETRoute) string {
+	return fmt.Sprintf("type3/%s/%d/%s", route.RD, route.VNI, route.VTEP)
 }

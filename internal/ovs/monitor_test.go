@@ -14,9 +14,13 @@ type monitorOVS struct {
 	scans [][]FDBEntry
 }
 
-func (*monitorOVS) IsVXLANBridge(context.Context) (bool, error)            { return true, nil }
-func (*monitorOVS) AddRemoteMAC(context.Context, event.EVPNRoute) error    { return nil }
-func (*monitorOVS) DeleteRemoteMAC(context.Context, event.EVPNRoute) error { return nil }
+func (*monitorOVS) IsVXLANBridge(context.Context) (bool, error)             { return true, nil }
+func (*monitorOVS) EnableSplitHorizon(context.Context) error                { return nil }
+func (*monitorOVS) ClearRemoteState(context.Context) error                  { return nil }
+func (*monitorOVS) AddRemoteMAC(context.Context, event.EVPNRoute) error     { return nil }
+func (*monitorOVS) DeleteRemoteMAC(context.Context, event.EVPNRoute) error  { return nil }
+func (*monitorOVS) AddRemoteVTEP(context.Context, event.IMETRoute) error    { return nil }
+func (*monitorOVS) DeleteRemoteVTEP(context.Context, event.IMETRoute) error { return nil }
 func (o *monitorOVS) LocalMACs(context.Context) ([]FDBEntry, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -49,6 +53,9 @@ func (a *recordingAnnouncer) Withdraw(_ context.Context, route event.EVPNRoute) 
 	a.cancel()
 	return nil
 }
+
+func (*recordingAnnouncer) AnnounceIMET(context.Context, event.IMETRoute) error { return nil }
+func (*recordingAnnouncer) WithdrawIMET(context.Context, event.IMETRoute) error { return nil }
 
 func TestMonitorAnnouncesAndWithdrawsMAC(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

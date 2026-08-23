@@ -12,6 +12,8 @@ import (
 type Announcer interface {
 	Announce(context.Context, event.EVPNRoute) error
 	Withdraw(context.Context, event.EVPNRoute) error
+	AnnounceIMET(context.Context, event.IMETRoute) error
+	WithdrawIMET(context.Context, event.IMETRoute) error
 }
 
 type MonitorConfig struct {

@@ -37,11 +37,11 @@ func (c *Client) Close() error {
 
 // Watch starts independent EVPN table and peer-state streams. Protobuf values
 // do not cross the internal/gobgp package boundary.
-func (c *Client) Watch(ctx context.Context, routeEvents chan<- event.RouteEvent, peerEvents chan<- event.PeerEvent) error {
+func (c *Client) Watch(ctx context.Context, routeEvents chan<- event.RouteEvent, imetEvents chan<- event.IMETEvent, peerEvents chan<- event.PeerEvent) error {
 	errs := make(chan error, 2)
 
 	go func() {
-		errs <- watchTable(ctx, c.client, routeEvents)
+		errs <- watchTable(ctx, c.client, routeEvents, imetEvents)
 	}()
 	go func() {
 		errs <- watchPeers(ctx, c.client, peerEvents)
@@ -55,7 +55,7 @@ func (c *Client) Watch(ctx context.Context, routeEvents chan<- event.RouteEvent,
 	}
 }
 
-func watchTable(ctx context.Context, client api.GoBgpServiceClient, events chan<- event.RouteEvent) error {
+func watchTable(ctx context.Context, client api.GoBgpServiceClient, routeEvents chan<- event.RouteEvent, imetEvents chan<- event.IMETEvent) error {
 	stream, err := client.WatchEvent(ctx, &api.WatchEventRequest{
 		Table: &api.WatchEventRequest_Table{
 			Filters: []*api.WatchEventRequest_Table_Filter{
@@ -85,6 +85,19 @@ func watchTable(ctx context.Context, client api.GoBgpServiceClient, events chan<
 		}
 
 		for _, path := range table.GetPaths() {
+			if path.GetNlri().GetEvpnMulticast() != nil {
+				imetEvent, err := DecodeIMET(path)
+				if err != nil {
+					logging.Warningf("skip EVPN Type-3 path: %v", err)
+					continue
+				}
+				select {
+				case imetEvents <- *imetEvent:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				continue
+			}
 			routeEvent, err := DecodeRoute(path)
 			if err != nil {
 				logging.Warningf("skip EVPN path: %v", err)
@@ -92,7 +105,7 @@ func watchTable(ctx context.Context, client api.GoBgpServiceClient, events chan<
 			}
 
 			select {
-			case events <- *routeEvent:
+			case routeEvents <- *routeEvent:
 			case <-ctx.Done():
 				return ctx.Err()
 			}

@@ -24,8 +24,12 @@ type FDBEntry struct {
 // OpenVSwitch is the dataplane boundary used by Snout.
 type OpenVSwitch interface {
 	IsVXLANBridge(context.Context) (bool, error)
+	EnableSplitHorizon(context.Context) error
+	ClearRemoteState(context.Context) error
 	AddRemoteMAC(context.Context, event.EVPNRoute) error
 	DeleteRemoteMAC(context.Context, event.EVPNRoute) error
+	AddRemoteVTEP(context.Context, event.IMETRoute) error
+	DeleteRemoteVTEP(context.Context, event.IMETRoute) error
 	LocalMACs(context.Context) ([]FDBEntry, error)
 }
 
@@ -36,7 +40,7 @@ func (c *Client) IsVXLANBridge(ctx context.Context) (bool, error) {
 	}
 	for _, line := range strings.Split(string(output), "\n") {
 		name := strings.TrimSpace(line)
-		if name == "" {
+		if name == "" || strings.HasPrefix(name, "sn-") {
 			continue
 		}
 		interfaceType, err := c.runner.Run(ctx, "ovs-vsctl", "get", "Interface", name, "type")
@@ -50,6 +54,72 @@ func (c *Client) IsVXLANBridge(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
+func (c *Client) ClearRemoteState(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var firstErr error
+	for key := range c.routes {
+		separator := strings.Index(key, "/")
+		if separator == -1 {
+			continue
+		}
+		mac := key[separator+1:]
+		if _, err := c.runner.Run(ctx, "ovs-appctl", "fdb/del", c.bridge, "0", mac); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("delete MAC %s from OVS FDB: %w", mac, err)
+		}
+	}
+	ports := make(map[string]struct{}, len(c.tunnels))
+	for port := range c.tunnels {
+		ports[port] = struct{}{}
+	}
+	output, err := c.runner.Run(ctx, "ovs-vsctl", "list-ifaces", c.bridge)
+	if err != nil {
+		if firstErr == nil {
+			firstErr = fmt.Errorf("list interfaces on OVS bridge %s: %w", c.bridge, err)
+		}
+	} else {
+		for _, line := range strings.Split(string(output), "\n") {
+			name := strings.TrimSpace(line)
+			if strings.HasPrefix(name, "sn-") {
+				ports[name] = struct{}{}
+			}
+		}
+	}
+	for port := range ports {
+		if _, err := c.runner.Run(ctx, "ovs-vsctl", "--if-exists", "del-port", c.bridge, port); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("delete VXLAN port %s: %w", port, err)
+		}
+	}
+	c.routes = make(map[string]string)
+	c.members = make(map[string]string)
+	c.tunnels = make(map[string]*tunnelReferences)
+	return firstErr
+}
+
+func (c *Client) EnableSplitHorizon(ctx context.Context) error {
+	output, err := c.runner.Run(ctx, "ovs-vsctl", "list-ifaces", c.bridge)
+	if err != nil {
+		return fmt.Errorf("list interfaces on OVS bridge %s: %w", c.bridge, err)
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		name := strings.TrimSpace(line)
+		if name == "" {
+			continue
+		}
+		interfaceType, err := c.runner.Run(ctx, "ovs-vsctl", "get", "Interface", name, "type")
+		if err != nil {
+			return fmt.Errorf("get OVS interface %s type: %w", name, err)
+		}
+		if !strings.EqualFold(strings.Trim(strings.TrimSpace(string(interfaceType)), "\""), "vxlan") {
+			continue
+		}
+		if _, err := c.runner.Run(ctx, "ovs-vsctl", "set", "Port", name, "protected=true"); err != nil {
+			return fmt.Errorf("protect OVS VXLAN port %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
 // Runner executes Open vSwitch command-line tools.
 type Runner interface {
 	Run(context.Context, string, ...string) ([]byte, error)
@@ -60,9 +130,15 @@ type Client struct {
 	bridge string
 	runner Runner
 
-	mu        sync.Mutex
-	routes    map[string]string
-	portUsers map[string]int
+	mu      sync.Mutex
+	routes  map[string]string
+	members map[string]string
+	tunnels map[string]*tunnelReferences
+}
+
+type tunnelReferences struct {
+	macs int
+	imet bool
 }
 
 func NewClient(bridge string, runner Runner) (*Client, error) {
@@ -74,10 +150,11 @@ func NewClient(bridge string, runner Runner) (*Client, error) {
 	}
 
 	return &Client{
-		bridge:    bridge,
-		runner:    runner,
-		routes:    make(map[string]string),
-		portUsers: make(map[string]int),
+		bridge:  bridge,
+		runner:  runner,
+		routes:  make(map[string]string),
+		members: make(map[string]string),
+		tunnels: make(map[string]*tunnelReferences),
 	}, nil
 }
 
@@ -95,8 +172,8 @@ func (c *Client) AddRemoteMAC(ctx context.Context, route event.EVPNRoute) error 
 		return nil
 	}
 
-	if _, err := c.runner.Run(ctx, "ovs-vsctl", "--may-exist", "add-port", c.bridge, port, "--", "set", "Interface", port, "type=vxlan", "options:remote_ip="+route.VTEP, "options:key="+strconv.FormatUint(uint64(route.VNI), 10)); err != nil {
-		return fmt.Errorf("create VXLAN port %s: %w", port, err)
+	if err := c.ensureTunnelPort(ctx, route.VNI, route.VTEP, port); err != nil {
+		return err
 	}
 	if _, err := c.runner.Run(ctx, "ovs-appctl", "fdb/add", c.bridge, port, "0", route.MAC); err != nil {
 		return fmt.Errorf("add MAC %s to OVS FDB: %w", route.MAC, err)
@@ -104,11 +181,46 @@ func (c *Client) AddRemoteMAC(ctx context.Context, route event.EVPNRoute) error 
 
 	oldPort, hadOldPort := c.routes[key]
 	c.routes[key] = port
-	c.portUsers[port]++
+	c.tunnels[port].macs++
 	if hadOldPort {
-		return c.releasePort(ctx, oldPort)
+		return c.releaseMACPort(ctx, oldPort)
 	}
 	return nil
+}
+
+func (c *Client) AddRemoteVTEP(ctx context.Context, route event.IMETRoute) error {
+	if err := validateIMETRoute(route); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := imetKey(route)
+	if _, exists := c.members[key]; exists {
+		return nil
+	}
+	port := tunnelPort(route.VNI, route.VTEP)
+	if err := c.ensureTunnelPort(ctx, route.VNI, route.VTEP, port); err != nil {
+		return err
+	}
+	c.members[key] = port
+	c.tunnels[port].imet = true
+	return nil
+}
+
+func (c *Client) DeleteRemoteVTEP(ctx context.Context, route event.IMETRoute) error {
+	if err := validateIMETRoute(route); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := imetKey(route)
+	port, exists := c.members[key]
+	if !exists {
+		return nil
+	}
+	delete(c.members, key)
+	c.tunnels[port].imet = false
+	return c.cleanupPort(ctx, port)
 }
 
 func (c *Client) DeleteRemoteMAC(ctx context.Context, route event.EVPNRoute) error {
@@ -129,18 +241,43 @@ func (c *Client) DeleteRemoteMAC(ctx context.Context, route event.EVPNRoute) err
 		return nil
 	}
 	delete(c.routes, key)
-	return c.releasePort(ctx, port)
+	return c.releaseMACPort(ctx, port)
 }
 
-func (c *Client) releasePort(ctx context.Context, port string) error {
-	c.portUsers[port]--
-	if c.portUsers[port] > 0 {
+func (c *Client) releaseMACPort(ctx context.Context, port string) error {
+	references := c.tunnels[port]
+	if references == nil {
 		return nil
 	}
-	delete(c.portUsers, port)
+	if references.macs > 0 {
+		references.macs--
+	}
+	return c.cleanupPort(ctx, port)
+}
+
+func (c *Client) cleanupPort(ctx context.Context, port string) error {
+	references := c.tunnels[port]
+	if references == nil {
+		return nil
+	}
+	if references.macs > 0 || references.imet {
+		return nil
+	}
+	delete(c.tunnels, port)
 	if _, err := c.runner.Run(ctx, "ovs-vsctl", "--if-exists", "del-port", c.bridge, port); err != nil {
 		return fmt.Errorf("delete unused VXLAN port %s: %w", port, err)
 	}
+	return nil
+}
+
+func (c *Client) ensureTunnelPort(ctx context.Context, vni uint32, vtep, port string) error {
+	if c.tunnels[port] != nil {
+		return nil
+	}
+	if _, err := c.runner.Run(ctx, "ovs-vsctl", "--may-exist", "add-port", c.bridge, port, "--", "set", "Interface", port, "type=vxlan", "options:remote_ip="+vtep, "options:key="+strconv.FormatUint(uint64(vni), 10), "--", "set", "Port", port, "protected=true"); err != nil {
+		return fmt.Errorf("create VXLAN port %s: %w", port, err)
+	}
+	c.tunnels[port] = &tunnelReferences{}
 	return nil
 }
 
@@ -221,8 +358,19 @@ func validateRoute(route event.EVPNRoute) error {
 	return nil
 }
 
+func validateIMETRoute(route event.IMETRoute) error {
+	if route.VNI == 0 || net.ParseIP(route.VTEP) == nil {
+		return fmt.Errorf("IMET route must contain a valid VNI and VTEP")
+	}
+	return nil
+}
+
 func routeKey(route event.EVPNRoute) string {
 	return fmt.Sprintf("%d/%s", route.VNI, strings.ToLower(route.MAC))
+}
+
+func imetKey(route event.IMETRoute) string {
+	return fmt.Sprintf("%d/%s", route.VNI, route.VTEP)
 }
 
 func tunnelPort(vni uint32, vtep string) string {
