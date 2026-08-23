@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	api "github.com/osrg/gobgp/v4/api"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/xslonikx/snout/internal/event"
 )
@@ -50,7 +52,7 @@ func (c *Client) WithdrawIMET(ctx context.Context, route event.IMETRoute) error 
 		}
 		request.Path = path
 	}
-	if _, err := c.client.DeletePath(ctx, request); err != nil {
+	if _, err := c.client.DeletePath(ctx, request); err != nil && status.Code(err) != codes.NotFound {
 		return fmt.Errorf("delete EVPN Type-3 path: %w", err)
 	}
 	c.mu.Lock()
@@ -98,7 +100,7 @@ func (c *Client) Withdraw(ctx context.Context, route event.EVPNRoute) error {
 		}
 		request.Path = path
 	}
-	if _, err := c.client.DeletePath(ctx, request); err != nil {
+	if _, err := c.client.DeletePath(ctx, request); err != nil && status.Code(err) != codes.NotFound {
 		return fmt.Errorf("delete EVPN path: %w", err)
 	}
 

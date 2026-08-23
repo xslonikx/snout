@@ -2,6 +2,7 @@ package ovs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -18,11 +19,13 @@ type command struct {
 type fakeRunner struct {
 	commands []command
 	outputs  map[string][]byte
+	errors   map[string]error
 }
 
 func (r *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
 	r.commands = append(r.commands, command{name: name, args: append([]string(nil), args...)})
-	return r.outputs[name+" "+strings.Join(args, " ")], nil
+	key := name + " " + strings.Join(args, " ")
+	return r.outputs[key], r.errors[key]
 }
 
 func TestClientAddsAndDeletesRemoteMAC(t *testing.T) {
@@ -42,7 +45,8 @@ func TestClientAddsAndDeletesRemoteMAC(t *testing.T) {
 	}
 
 	want := []command{
-		{name: "ovs-vsctl", args: []string{"--may-exist", "add-port", "br0", port, "--", "set", "Interface", port, "type=vxlan", "options:remote_ip=192.0.2.20", "options:key=100", "--", "set", "Port", port, "protected=true"}},
+		{name: "ovs-vsctl", args: []string{"--if-exists", "get", "Interface", port, "name"}},
+		{name: "ovs-vsctl", args: []string{"--may-exist", "add-port", "br0", port, "--", "set", "Interface", port, "type=vxlan", "options:remote_ip=192.0.2.20", "options:key=100", "external_ids:snout-owned=true", "external_ids:snout-vni=100", "external_ids:snout-vtep=192.0.2.20", "--", "set", "Port", port, "protected=true"}},
 		{name: "ovs-appctl", args: []string{"fdb/add", "br0", port, "0", route.MAC}},
 		{name: "ovs-appctl", args: []string{"fdb/del", "br0", "0", route.MAC}},
 		{name: "ovs-vsctl", args: []string{"--if-exists", "del-port", "br0", port}},
@@ -80,12 +84,33 @@ func TestIMETRetainsTunnelPortAfterType2Withdrawal(t *testing.T) {
 	}
 	deleteCommands := 0
 	for _, command := range runner.commands {
-		if command.name == "ovs-vsctl" && len(command.args) > 0 && command.args[0] == "--if-exists" {
+		if command.name == "ovs-vsctl" && len(command.args) > 1 && command.args[0] == "--if-exists" && command.args[1] == "del-port" {
 			deleteCommands++
 		}
 	}
 	if deleteCommands != 1 {
 		t.Fatalf("got %d tunnel deletion commands, want 1", deleteCommands)
+	}
+}
+
+func TestTunnelCreationDoesNotReplaceUserInterface(t *testing.T) {
+	route := event.IMETRoute{VNI: 100, VTEP: "192.0.2.20"}
+	port := tunnelPort(route.VNI, route.VTEP)
+	runner := &fakeRunner{outputs: map[string][]byte{
+		"ovs-vsctl --if-exists get Interface " + port + " name":         []byte("\"" + port + "\"\n"),
+		"ovs-vsctl get Interface " + port + " external_ids:snout-owned": []byte("[]\n"),
+	}}
+	client, err := NewClient("br0", runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.AddRemoteVTEP(context.Background(), route); err == nil {
+		t.Fatal("user-owned interface collision was not rejected")
+	}
+	for _, command := range runner.commands {
+		if len(command.args) > 1 && command.args[1] == "add-port" {
+			t.Fatal("user interface was modified")
+		}
 	}
 }
 
@@ -117,78 +142,100 @@ func TestType2RetainsTunnelPortAfterIMETWithdrawal(t *testing.T) {
 	}
 }
 
-func TestEnableSplitHorizonProtectsVXLANPorts(t *testing.T) {
+func TestDeleteUnknownRemoteMACIsIdempotent(t *testing.T) {
+	runner := &fakeRunner{outputs: make(map[string][]byte)}
+	client, err := NewClient("br0", runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route := event.EVPNRoute{VNI: 100, MAC: "02:00:00:00:00:01", VTEP: "192.0.2.20"}
+	if err := client.DeleteRemoteMAC(context.Background(), route); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.commands) != 0 {
+		t.Fatalf("unknown MAC deletion touched OVS: %#v", runner.commands)
+	}
+}
+
+func TestBridgeExists(t *testing.T) {
 	runner := &fakeRunner{outputs: map[string][]byte{
-		"ovs-vsctl list-ifaces br0":           []byte("tap0\nvxlan0\n"),
-		"ovs-vsctl get Interface tap0 type":   []byte("\"\"\n"),
-		"ovs-vsctl get Interface vxlan0 type": []byte("\"vxlan\"\n"),
+		"ovs-vsctl --if-exists get Bridge br0 name": []byte("\"br0\"\n"),
 	}}
 	client, err := NewClient("br0", runner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := client.EnableSplitHorizon(context.Background()); err != nil {
+
+	exists, err := client.BridgeExists(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
-	want := command{name: "ovs-vsctl", args: []string{"set", "Port", "vxlan0", "protected=true"}}
+	if !exists {
+		t.Fatal("existing bridge was not detected")
+	}
+}
+
+func TestMissingBridgeDoesNotExist(t *testing.T) {
+	runner := &fakeRunner{outputs: make(map[string][]byte)}
+	client, err := NewClient("br0", runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exists, err := client.BridgeExists(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Fatal("missing bridge was detected")
+	}
+}
+
+func TestClearRemoteStateDeletesOnlyOwnedPorts(t *testing.T) {
+	runner := &fakeRunner{outputs: map[string][]byte{
+		"ovs-vsctl list-ifaces br0":                                   []byte("sn-owned\nvxlan-user\n"),
+		"ovs-vsctl get Interface sn-owned external_ids:snout-owned":   []byte("true\n"),
+		"ovs-vsctl get Interface vxlan-user external_ids:snout-owned": []byte("[]\n"),
+	}}
+	client, err := NewClient("br0", runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ClearRemoteState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, got := range runner.commands {
+		if reflect.DeepEqual(got.args, []string{"--if-exists", "del-port", "br0", "vxlan-user"}) {
+			t.Fatal("user VXLAN port was deleted")
+		}
+	}
+	want := command{name: "ovs-vsctl", args: []string{"--if-exists", "del-port", "br0", "sn-owned"}}
 	if got := runner.commands[len(runner.commands)-1]; !reflect.DeepEqual(got, want) {
-		t.Fatalf("split-horizon command mismatch: got %#v, want %#v", got, want)
+		t.Fatalf("owned port deletion mismatch: got %#v, want %#v", got, want)
 	}
 }
 
-func TestIsVXLANBridge(t *testing.T) {
-	runner := &fakeRunner{outputs: map[string][]byte{
-		"ovs-vsctl list-ifaces br0":           []byte("tap0\nvxlan0\n"),
-		"ovs-vsctl get Interface tap0 type":   []byte("\"\"\n"),
-		"ovs-vsctl get Interface vxlan0 type": []byte("\"vxlan\"\n"),
-	}}
+func TestClearRemoteStateContinuesAfterFDBError(t *testing.T) {
+	deleteFDB := "ovs-appctl fdb/del br0 0 02:00:00:00:00:01"
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"ovs-vsctl list-ifaces br0":                                 []byte("sn-owned\n"),
+			"ovs-vsctl get Interface sn-owned external_ids:snout-owned": []byte("true\n"),
+		},
+		errors: map[string]error{deleteFDB: errors.New("FDB failure")},
+	}
 	client, err := NewClient("br0", runner)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	isVXLAN, err := client.IsVXLANBridge(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	route := event.EVPNRoute{VNI: 100, MAC: "02:00:00:00:00:01", VTEP: "192.0.2.20"}
+	client.routes[routeKey(route)] = "sn-owned"
+	if err := client.ClearRemoteState(context.Background()); err == nil {
+		t.Fatal("FDB error was not returned")
 	}
-	if !isVXLAN {
-		t.Fatal("bridge with a VXLAN interface was not detected")
-	}
-}
-
-func TestRegularBridgeIsNotVXLAN(t *testing.T) {
-	runner := &fakeRunner{outputs: map[string][]byte{
-		"ovs-vsctl list-ifaces br0":         []byte("tap0\n"),
-		"ovs-vsctl get Interface tap0 type": []byte("\"\"\n"),
-	}}
-	client, err := NewClient("br0", runner)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	isVXLAN, err := client.IsVXLANBridge(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if isVXLAN {
-		t.Fatal("regular bridge was detected as VXLAN")
-	}
-}
-
-func TestManagedTunnelDoesNotActivateBridge(t *testing.T) {
-	runner := &fakeRunner{outputs: map[string][]byte{
-		"ovs-vsctl list-ifaces br0": []byte("sn-0123456789ab\n"),
-	}}
-	client, err := NewClient("br0", runner)
-	if err != nil {
-		t.Fatal(err)
-	}
-	isVXLAN, err := client.IsVXLANBridge(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if isVXLAN {
-		t.Fatal("Snout-managed tunnel must not activate a bridge by itself")
+	want := command{name: "ovs-vsctl", args: []string{"--if-exists", "del-port", "br0", "sn-owned"}}
+	if got := runner.commands[len(runner.commands)-1]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cleanup stopped before port deletion: got %#v", got)
 	}
 }
 

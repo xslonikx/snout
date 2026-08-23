@@ -35,15 +35,6 @@ func MonitorLocalMACs(ctx context.Context, ovs OpenVSwitch, announcer Announcer,
 	}
 
 	known := make(map[string]event.EVPNRoute)
-	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		for mac, route := range known {
-			if err := announcer.Withdraw(shutdownCtx, route); err != nil {
-				logging.Errorf("withdraw local MAC %s during shutdown: %v", mac, err)
-			}
-		}
-	}()
 	ticker := time.NewTicker(config.Interval)
 	defer ticker.Stop()
 

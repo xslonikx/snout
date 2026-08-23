@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,8 +24,7 @@ type FDBEntry struct {
 
 // OpenVSwitch is the dataplane boundary used by Snout.
 type OpenVSwitch interface {
-	IsVXLANBridge(context.Context) (bool, error)
-	EnableSplitHorizon(context.Context) error
+	BridgeExists(context.Context) (bool, error)
 	ClearRemoteState(context.Context) error
 	AddRemoteMAC(context.Context, event.EVPNRoute) error
 	DeleteRemoteMAC(context.Context, event.EVPNRoute) error
@@ -33,39 +33,26 @@ type OpenVSwitch interface {
 	LocalMACs(context.Context) ([]FDBEntry, error)
 }
 
-func (c *Client) IsVXLANBridge(ctx context.Context) (bool, error) {
-	output, err := c.runner.Run(ctx, "ovs-vsctl", "list-ifaces", c.bridge)
+func (c *Client) BridgeExists(ctx context.Context) (bool, error) {
+	output, err := c.runner.Run(ctx, "ovs-vsctl", "--if-exists", "get", "Bridge", c.bridge, "name")
 	if err != nil {
-		return false, fmt.Errorf("list interfaces on OVS bridge %s: %w", c.bridge, err)
+		return false, fmt.Errorf("inspect OVS bridge %s: %w", c.bridge, err)
 	}
-	for _, line := range strings.Split(string(output), "\n") {
-		name := strings.TrimSpace(line)
-		if name == "" || strings.HasPrefix(name, "sn-") {
-			continue
-		}
-		interfaceType, err := c.runner.Run(ctx, "ovs-vsctl", "get", "Interface", name, "type")
-		if err != nil {
-			return false, fmt.Errorf("get OVS interface %s type: %w", name, err)
-		}
-		if strings.EqualFold(strings.Trim(strings.TrimSpace(string(interfaceType)), "\""), "vxlan") {
-			return true, nil
-		}
-	}
-	return false, nil
+	return strings.Trim(strings.TrimSpace(string(output)), "\"") != "", nil
 }
 
 func (c *Client) ClearRemoteState(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	var firstErr error
+	var errs []error
 	for key := range c.routes {
 		separator := strings.Index(key, "/")
 		if separator == -1 {
 			continue
 		}
 		mac := key[separator+1:]
-		if _, err := c.runner.Run(ctx, "ovs-appctl", "fdb/del", c.bridge, "0", mac); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("delete MAC %s from OVS FDB: %w", mac, err)
+		if _, err := c.runner.Run(ctx, "ovs-appctl", "fdb/del", c.bridge, "0", mac); err != nil {
+			errs = append(errs, fmt.Errorf("delete MAC %s from OVS FDB: %w", mac, err))
 		}
 	}
 	ports := make(map[string]struct{}, len(c.tunnels))
@@ -74,50 +61,32 @@ func (c *Client) ClearRemoteState(ctx context.Context) error {
 	}
 	output, err := c.runner.Run(ctx, "ovs-vsctl", "list-ifaces", c.bridge)
 	if err != nil {
-		if firstErr == nil {
-			firstErr = fmt.Errorf("list interfaces on OVS bridge %s: %w", c.bridge, err)
-		}
+		errs = append(errs, fmt.Errorf("list interfaces on OVS bridge %s: %w", c.bridge, err))
 	} else {
 		for _, line := range strings.Split(string(output), "\n") {
 			name := strings.TrimSpace(line)
-			if strings.HasPrefix(name, "sn-") {
+			if name == "" {
+				continue
+			}
+			ownedOutput, ownershipErr := c.runner.Run(ctx, "ovs-vsctl", "get", "Interface", name, "external_ids:snout-owned")
+			if ownershipErr != nil {
+				errs = append(errs, fmt.Errorf("inspect OVS interface %s ownership: %w", name, ownershipErr))
+				continue
+			}
+			if strings.Trim(strings.TrimSpace(string(ownedOutput)), "\"") == "true" {
 				ports[name] = struct{}{}
 			}
 		}
 	}
 	for port := range ports {
-		if _, err := c.runner.Run(ctx, "ovs-vsctl", "--if-exists", "del-port", c.bridge, port); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("delete VXLAN port %s: %w", port, err)
+		if _, err := c.runner.Run(ctx, "ovs-vsctl", "--if-exists", "del-port", c.bridge, port); err != nil {
+			errs = append(errs, fmt.Errorf("delete VXLAN port %s: %w", port, err))
 		}
 	}
 	c.routes = make(map[string]string)
 	c.members = make(map[string]string)
 	c.tunnels = make(map[string]*tunnelReferences)
-	return firstErr
-}
-
-func (c *Client) EnableSplitHorizon(ctx context.Context) error {
-	output, err := c.runner.Run(ctx, "ovs-vsctl", "list-ifaces", c.bridge)
-	if err != nil {
-		return fmt.Errorf("list interfaces on OVS bridge %s: %w", c.bridge, err)
-	}
-	for _, line := range strings.Split(string(output), "\n") {
-		name := strings.TrimSpace(line)
-		if name == "" {
-			continue
-		}
-		interfaceType, err := c.runner.Run(ctx, "ovs-vsctl", "get", "Interface", name, "type")
-		if err != nil {
-			return fmt.Errorf("get OVS interface %s type: %w", name, err)
-		}
-		if !strings.EqualFold(strings.Trim(strings.TrimSpace(string(interfaceType)), "\""), "vxlan") {
-			continue
-		}
-		if _, err := c.runner.Run(ctx, "ovs-vsctl", "set", "Port", name, "protected=true"); err != nil {
-			return fmt.Errorf("protect OVS VXLAN port %s: %w", name, err)
-		}
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // Runner executes Open vSwitch command-line tools.
@@ -231,14 +200,13 @@ func (c *Client) DeleteRemoteMAC(ctx context.Context, route event.EVPNRoute) err
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if _, err := c.runner.Run(ctx, "ovs-appctl", "fdb/del", c.bridge, "0", route.MAC); err != nil {
-		return fmt.Errorf("delete MAC %s from OVS FDB: %w", route.MAC, err)
-	}
-
 	key := routeKey(route)
 	port, ok := c.routes[key]
 	if !ok {
 		return nil
+	}
+	if _, err := c.runner.Run(ctx, "ovs-appctl", "fdb/del", c.bridge, "0", route.MAC); err != nil {
+		return fmt.Errorf("delete MAC %s from OVS FDB: %w", route.MAC, err)
 	}
 	delete(c.routes, key)
 	return c.releaseMACPort(ctx, port)
@@ -274,7 +242,23 @@ func (c *Client) ensureTunnelPort(ctx context.Context, vni uint32, vtep, port st
 	if c.tunnels[port] != nil {
 		return nil
 	}
-	if _, err := c.runner.Run(ctx, "ovs-vsctl", "--may-exist", "add-port", c.bridge, port, "--", "set", "Interface", port, "type=vxlan", "options:remote_ip="+vtep, "options:key="+strconv.FormatUint(uint64(vni), 10), "--", "set", "Port", port, "protected=true"); err != nil {
+	existingOutput, err := c.runner.Run(ctx, "ovs-vsctl", "--if-exists", "get", "Interface", port, "name")
+	if err != nil {
+		return fmt.Errorf("inspect VXLAN port %s: %w", port, err)
+	}
+	if strings.Trim(strings.TrimSpace(string(existingOutput)), "\"") != "" {
+		ownedOutput, err := c.runner.Run(ctx, "ovs-vsctl", "get", "Interface", port, "external_ids:snout-owned")
+		if err != nil {
+			return fmt.Errorf("inspect VXLAN port %s ownership: %w", port, err)
+		}
+		if strings.Trim(strings.TrimSpace(string(ownedOutput)), "\"") == "true" {
+			c.tunnels[port] = &tunnelReferences{}
+			return nil
+		}
+		return fmt.Errorf("refuse to replace non-Snout OVS interface %s", port)
+	}
+	vniText := strconv.FormatUint(uint64(vni), 10)
+	if _, err := c.runner.Run(ctx, "ovs-vsctl", "--may-exist", "add-port", c.bridge, port, "--", "set", "Interface", port, "type=vxlan", "options:remote_ip="+vtep, "options:key="+vniText, "external_ids:snout-owned=true", "external_ids:snout-vni="+vniText, "external_ids:snout-vtep="+vtep, "--", "set", "Port", port, "protected=true"); err != nil {
 		return fmt.Errorf("create VXLAN port %s: %w", port, err)
 	}
 	c.tunnels[port] = &tunnelReferences{}

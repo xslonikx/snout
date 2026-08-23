@@ -5,9 +5,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,7 +24,10 @@ import (
 const (
 	eventQueueSize      = 128
 	defaultPollInterval = 5 * time.Second
+	shutdownTimeout     = 15 * time.Second
 )
+
+var errForcedShutdown = errors.New("graceful shutdown interrupted by a repeated signal")
 
 func main() {
 	os.Exit(mainExit())
@@ -55,6 +60,7 @@ func mainExit() int {
 
 	if err := run(appConfig); err != nil && !errors.Is(err, context.Canceled) {
 		logging.Errorf("Snout stopped: %v", err)
+		fmt.Fprintf(os.Stderr, "snout: %v\n", err)
 		_ = logging.Close()
 		return 1
 	}
@@ -63,7 +69,14 @@ func mainExit() int {
 }
 
 func run(appConfig config.Config) error {
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	return runWithSignals(appConfig, signals, os.Stderr)
+}
+
+func runWithSignals(appConfig config.Config, signals <-chan os.Signal, stderr io.Writer) error {
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	routeEvents := make(chan event.RouteEvent, eventQueueSize)
@@ -79,8 +92,13 @@ func run(appConfig config.Config) error {
 	if err != nil {
 		return fmt.Errorf("create GoBGP client: %w", err)
 	}
-	defer bgpClient.Close()
-
+	var closeOnce sync.Once
+	var closeErr error
+	closeBGP := func() error {
+		closeOnce.Do(func() { closeErr = bgpClient.Close() })
+		return closeErr
+	}
+	defer closeBGP()
 	var manager *ovs.Manager
 	if len(appConfig.BridgeList) != 0 {
 		monitorConfig, routeTarget, err := ovsConfigFromEnv()
@@ -100,22 +118,96 @@ func run(appConfig config.Config) error {
 	go bus.RunRouteQueue(ctx, routeEvents)
 	go bus.RunIMETQueue(ctx, imetEvents)
 	go bus.RunPeerQueue(ctx, peerEvents)
-	if manager == nil {
-		return bgpClient.Watch(ctx, routeEvents, imetEvents, peerEvents)
-	}
-
 	errs := make(chan error, 2)
 	go func() {
 		errs <- bgpClient.Watch(ctx, routeEvents, imetEvents, peerEvents)
 	}()
+	if manager != nil {
+		go func() {
+			errs <- manager.Run(ctx)
+		}()
+	}
+
+	select {
+	case received := <-signals:
+		stopWorkers := func() {
+			if manager != nil {
+				manager.StopAccepting()
+			}
+			cancel()
+		}
+		return handleSignalShutdown(received, signals, stderr, stopWorkers, func(shutdownCtx context.Context) error {
+			if manager == nil {
+				return nil
+			}
+			return manager.Shutdown(shutdownCtx)
+		}, closeBGP, shutdownTimeout)
+	case firstErr := <-errs:
+		if manager != nil {
+			manager.StopAccepting()
+		}
+		cancel()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer shutdownCancel()
+		var shutdownErr error
+		if manager != nil {
+			shutdownErr = manager.Shutdown(shutdownCtx)
+		}
+		return errors.Join(workerError(firstErr), shutdownErr, closeBGP())
+	}
+}
+
+func handleSignalShutdown(first os.Signal, signals <-chan os.Signal, stderr io.Writer, stopWorkers func(), cleanup func(context.Context) error, closeConnection func() error, timeout time.Duration) error {
+	name := signalName(first)
+	message := fmt.Sprintf("snout: received %s, graceful shutdown started", name)
+	fmt.Fprintln(stderr, message)
+	logging.Infof("received %s, graceful shutdown started", name)
+	stopWorkers()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	result := make(chan error, 1)
 	go func() {
-		errs <- manager.Run(ctx)
+		result <- cleanup(ctx)
 	}()
 
-	firstErr := <-errs
-	cancel()
-	secondErr := <-errs
-	return workerError(firstErr, secondErr)
+	select {
+	case err := <-result:
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			_ = closeConnection()
+			logging.Errorf("graceful shutdown timed out after %s", timeout)
+			return fmt.Errorf("graceful shutdown timed out after %s: %w", timeout, ctx.Err())
+		}
+		err = errors.Join(err, closeConnection())
+		if err != nil {
+			logging.Errorf("graceful shutdown failed: %v", err)
+			return fmt.Errorf("graceful shutdown failed: %w", err)
+		}
+		fmt.Fprintln(stderr, "snout: graceful shutdown completed")
+		logging.Infof("graceful shutdown completed")
+		return nil
+	case repeated := <-signals:
+		cancel()
+		_ = closeConnection()
+		repeatedName := signalName(repeated)
+		logging.Errorf("received %s during graceful shutdown; forcing termination", repeatedName)
+		return fmt.Errorf("%w: received %s", errForcedShutdown, repeatedName)
+	case <-ctx.Done():
+		_ = closeConnection()
+		logging.Errorf("graceful shutdown timed out after %s", timeout)
+		return fmt.Errorf("graceful shutdown timed out after %s: %w", timeout, ctx.Err())
+	}
+}
+
+func signalName(received os.Signal) string {
+	switch received {
+	case os.Interrupt:
+		return "SIGINT"
+	case syscall.SIGTERM:
+		return "SIGTERM"
+	default:
+		return received.String()
+	}
 }
 
 func workerError(errs ...error) error {

@@ -14,8 +14,7 @@ type monitorOVS struct {
 	scans [][]FDBEntry
 }
 
-func (*monitorOVS) IsVXLANBridge(context.Context) (bool, error)             { return true, nil }
-func (*monitorOVS) EnableSplitHorizon(context.Context) error                { return nil }
+func (*monitorOVS) BridgeExists(context.Context) (bool, error)              { return true, nil }
 func (*monitorOVS) ClearRemoteState(context.Context) error                  { return nil }
 func (*monitorOVS) AddRemoteMAC(context.Context, event.EVPNRoute) error     { return nil }
 func (*monitorOVS) DeleteRemoteMAC(context.Context, event.EVPNRoute) error  { return nil }

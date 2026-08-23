@@ -1,11 +1,26 @@
 package gobgp
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
+	api "github.com/osrg/gobgp/v4/api"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/xslonikx/snout/internal/event"
 )
+
+type deletePathClient struct {
+	api.GoBgpServiceClient
+	err error
+}
+
+func (c *deletePathClient) DeletePath(context.Context, *api.DeletePathRequest, ...grpc.CallOption) (*api.DeletePathResponse, error) {
+	return nil, c.err
+}
 
 func TestBuildEVPNType2Path(t *testing.T) {
 	client := &Client{paths: make(map[string][]byte), publisherConfig: PublisherConfig{RouteTarget: "65000:100"}}
@@ -52,5 +67,20 @@ func TestBuildEVPNType3Path(t *testing.T) {
 	}
 	if len(path.GetPattrs()[1].GetMpReach().GetNlris()) != 1 || path.GetPattrs()[1].GetMpReach().GetNlris()[0].GetEvpnMulticast() == nil {
 		t.Fatalf("MP_REACH does not contain the Type-3 NLRI: %#v", path.GetPattrs()[1].GetMpReach())
+	}
+}
+
+func TestWithdrawTreatsMissingPathAsSuccess(t *testing.T) {
+	route := event.EVPNRoute{RD: "65000:100", VNI: 100, MAC: "02:00:00:00:00:01", VTEP: "192.0.2.10"}
+	client := &Client{
+		client:          &deletePathClient{err: status.Error(codes.NotFound, "missing")},
+		paths:           map[string][]byte{publishedRouteKey(route): {1, 2, 3}},
+		publisherConfig: PublisherConfig{RouteTarget: "65000:100"},
+	}
+	if err := client.Withdraw(context.Background(), route); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := client.paths[publishedRouteKey(route)]; exists {
+		t.Fatal("missing path was not removed from local ownership state")
 	}
 }
