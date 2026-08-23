@@ -43,4 +43,14 @@ The fixed-port BUM dataplane relies on OVS `NORMAL` switching. A bridge controll
 
 Static FDB programming uses the `fdb/add` and `fdb/del` commands available in Open vSwitch 2.17 and newer.
 
+For a quick local Type-2 announcement/withdrawal test, use `scripts/fake-local-mac.sh`. It creates an internal OVS port and adds a synthetic local FDB entry:
+
+```sh
+sudo scripts/fake-local-mac.sh add
+sudo scripts/fake-local-mac.sh del
+sudo scripts/fake-local-mac.sh cleanup
+```
+
+The defaults are `BRIDGE=br0`, `PORT=fake-vm0`, and `MAC=02:00:00:00:00:42`. Override them as environment variables. If the bridge has no VXLAN interface, set `CREATE_VXLAN=1` to let the script create a temporary flow-based test interface.
+
 The minimum requirements for BUM forwarding are documented in [`docs/minimal-bum.md`](docs/minimal-bum.md). The planned flow-based VXLAN/OpenFlow implementation is tracked in [`TODO.md`](TODO.md).
