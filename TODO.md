@@ -5,6 +5,11 @@
 - [x] Implement Type-3 IMET publication/withdrawal, remote VTEP membership, fixed-port ingress replication, independent Type-2/Type-3 references, and protected-port split horizon as defined in [`docs/minimal-bum.md`](docs/minimal-bum.md).
 - [ ] Validate the minimum BUM integration scenarios in a multi-hypervisor lab, including ARP, unknown unicast, Ethernet multicast, split horizon, withdrawal, VNI isolation, and restart recovery.
 
+## Multi-VNI
+
+- [x] Multi-VNI with flat and VLAN-aware bridges, static VLAN<->VNI map with `vni_offset` and explicit `[[bridge.vni]]` overrides (see [`docs/workflows/phase_1.txt`](docs/workflows/phase_1.txt)).
+- [ ] Optionally derive the active VLANs from OVS access ports (`tag` of non-Snout ports, explicit `trunks`) instead of `vlans`, reusing `vni_offset`; announce/withdraw Type-3 when the first/last port of a VLAN appears/disappears.
+
 ## Flow-based VXLAN dataplane
 
 - [ ] Replace per-`(VNI, remote VTEP)` fixed VXLAN ports with an optional OpenFlow-based dataplane that uses one existing flow-based VXLAN interface per bridge:

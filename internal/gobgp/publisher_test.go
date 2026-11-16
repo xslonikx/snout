@@ -23,8 +23,8 @@ func (c *deletePathClient) DeletePath(context.Context, *api.DeletePathRequest, .
 }
 
 func TestBuildEVPNType2Path(t *testing.T) {
-	client := &Client{paths: make(map[string][]byte), publisherConfig: PublisherConfig{RouteTarget: "65000:100"}}
-	path, err := client.buildPath(event.EVPNRoute{RD: "65000:100", VNI: 100, MAC: "02:00:00:00:00:01", VTEP: "192.0.2.10"})
+	client := &Client{paths: make(map[string][]byte)}
+	path, err := client.buildPath(event.EVPNRoute{RD: "65000:100", VNI: 100, MAC: "02:00:00:00:00:01", VTEP: "192.0.2.10", RouteTarget: "65000:100"}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,8 +52,8 @@ func TestParseIPv4RouteDistinguisher(t *testing.T) {
 }
 
 func TestBuildEVPNType3Path(t *testing.T) {
-	client := &Client{paths: make(map[string][]byte), publisherConfig: PublisherConfig{RouteTarget: "65000:100"}}
-	path, err := client.buildIMETPath(event.IMETRoute{RD: "65000:100", VNI: 100, VTEP: "192.0.2.10"})
+	client := &Client{paths: make(map[string][]byte)}
+	path, err := client.buildIMETPath(event.IMETRoute{RD: "65000:100", VNI: 100, VTEP: "192.0.2.10", RouteTarget: "65000:100"}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,14 +73,85 @@ func TestBuildEVPNType3Path(t *testing.T) {
 func TestWithdrawTreatsMissingPathAsSuccess(t *testing.T) {
 	route := event.EVPNRoute{RD: "65000:100", VNI: 100, MAC: "02:00:00:00:00:01", VTEP: "192.0.2.10"}
 	client := &Client{
-		client:          &deletePathClient{err: status.Error(codes.NotFound, "missing")},
-		paths:           map[string][]byte{publishedRouteKey(route): {1, 2, 3}},
-		publisherConfig: PublisherConfig{RouteTarget: "65000:100"},
+		client: &deletePathClient{err: status.Error(codes.NotFound, "missing")},
+		paths:  map[string][]byte{publishedRouteKey(route): {1, 2, 3}},
 	}
 	if err := client.Withdraw(context.Background(), route); err != nil {
 		t.Fatal(err)
 	}
 	if _, exists := client.paths[publishedRouteKey(route)]; exists {
 		t.Fatal("missing path was not removed from local ownership state")
+	}
+}
+
+func TestRouteTargetIsTakenPerRoute(t *testing.T) {
+	client := &Client{paths: make(map[string][]byte)}
+	for _, test := range []struct {
+		vni       uint32
+		rt        string
+		wantASN   uint32
+		wantLocal uint32
+	}{
+		{10100, "65000:10100", 65000, 10100},
+		{10200, "65001:777", 65001, 777},
+	} {
+		path, err := client.buildPath(event.EVPNRoute{RD: "172.31.0.11:100", VNI: test.vni, MAC: "02:00:00:00:00:01", VTEP: "172.31.0.11", RouteTarget: test.rt}, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rt := path.GetPattrs()[2].GetExtendedCommunities().GetCommunities()[0].GetTwoOctetAsSpecific()
+		if rt.GetAsn() != test.wantASN || rt.GetLocalAdmin() != test.wantLocal {
+			t.Fatalf("VNI %d: got RT %d:%d, want %s", test.vni, rt.GetAsn(), rt.GetLocalAdmin(), test.rt)
+		}
+		imet, err := client.buildIMETPath(event.IMETRoute{RD: "172.31.0.11:100", VNI: test.vni, VTEP: "172.31.0.11", RouteTarget: test.rt}, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		imetRT := imet.GetPattrs()[2].GetExtendedCommunities().GetCommunities()[0].GetTwoOctetAsSpecific()
+		if imetRT.GetAsn() != test.wantASN || imetRT.GetLocalAdmin() != test.wantLocal {
+			t.Fatalf("Type-3 VNI %d: got RT %d:%d, want %s", test.vni, imetRT.GetAsn(), imetRT.GetLocalAdmin(), test.rt)
+		}
+	}
+}
+
+func TestAnnouncementRequiresRouteTarget(t *testing.T) {
+	client := &Client{paths: make(map[string][]byte)}
+	if _, err := client.buildPath(event.EVPNRoute{RD: "65000:100", VNI: 100, MAC: "02:00:00:00:00:01", VTEP: "192.0.2.10"}, true); err == nil {
+		t.Fatal("Type-2 announcement without route target was built")
+	}
+	if _, err := client.buildIMETPath(event.IMETRoute{RD: "65000:100", VNI: 100, VTEP: "192.0.2.10"}, true); err == nil {
+		t.Fatal("Type-3 announcement without route target was built")
+	}
+	path, err := client.buildPath(event.EVPNRoute{RD: "65000:100", VNI: 100, MAC: "02:00:00:00:00:01", VTEP: "192.0.2.10"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	communities := path.GetPattrs()[2].GetExtendedCommunities().GetCommunities()
+	if len(communities) != 1 || communities[0].GetEncap() == nil {
+		t.Fatalf("withdrawal path must carry only the encapsulation community: %#v", communities)
+	}
+}
+
+func TestFourOctetRouteTargetAndRD(t *testing.T) {
+	rt, err := parseRouteTarget("4200000000:100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rt.GetFourOctetAsSpecific().GetAsn() != 4200000000 || rt.GetFourOctetAsSpecific().GetLocalAdmin() != 100 {
+		t.Fatalf("unexpected route target: %#v", rt)
+	}
+	rd, err := parseRD("4200000000:7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rd.GetFourOctetAsn().GetAdmin() != 4200000000 || rd.GetFourOctetAsn().GetAssigned() != 7 {
+		t.Fatalf("unexpected route distinguisher: %#v", rd)
+	}
+	rd, err = parseRD("65000:70000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rd.GetTwoOctetAsn().GetAdmin() != 65000 || rd.GetTwoOctetAsn().GetAssigned() != 70000 {
+		t.Fatalf("unexpected route distinguisher: %#v", rd)
 	}
 }

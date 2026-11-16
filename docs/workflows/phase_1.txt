@@ -1,0 +1,381 @@
+SNOUT MULTI-VNI + TEST LAB - SPECIFICATION v4
+=============================================
+
+Status:  approved for implementation
+Date:    2026-11-02
+
+Changes since v3:
+  - Lab underlay is 172.31.0.0/24 on a dedicated vNIC, without a default
+    gateway. The management NIC (default route, internet access) is not
+    touched by the scripts.
+  - UPLINK_IF is therefore required (it can no longer be derived from the
+    default route) and the lab connection is configured with
+    ipv4.never-default=yes.
+  - GATEWAY/DNS removed from the lab env files.
+
+
+0. SCOPE
+--------
+
+Phases:
+  1. Snout code change: multi-VNI with flat and VLAN-aware bridges (section M).
+  2. Lab tooling in misc/, written against the new config (sections C, H, R,
+     U, S, L).
+
+Deliverables:
+  Phase 1: changes in internal/config, internal/ovs, internal/gobgp,
+           cmd/snout + unit tests; README.md, docs/minimal-bum.md,
+           snout.toml.example, TODO.md
+  Phase 2: misc/bootstrap-hypervisor.sh, misc/bootstrap-route-reflector.sh,
+           misc/snout-update.sh, misc/snout.service,
+           misc/lab/{rr,hv1,hv2,hv3}.env
+
+Out of scope:
+  - deriving the VLAN map from OVS (backlog item only);
+  - OpenFlow, static VXLAN ports, EVPN multihoming;
+  - route-target filtering on import;
+  - real VMs.
+
+General development rules (apply to both phases):
+  - avoid unneeded dependencies; only well-known libraries with
+    MIT-compatible licenses, no GPL;
+  - every new function or module is covered by unit tests;
+  - when a test fails, the code is fixed - tests are never adjusted or
+    mocked just to pass.
+
+
+M. SNOUT
+--------
+
+M1. Bridge modes
+
+  Every [[bridge]] is in exactly one mode:
+
+  - Flat: one VNI, no VLANs. Workload ports are untagged and the FDB uses
+    VLAN 0. The bridge passes all frames, tagged ones included; there is no
+    VLAN isolation inside it.
+  - VLAN-aware: a VLAN<->VNI map. OVS NORMAL switching learns and floods per
+    VLAN, so VNIs are isolated within one bridge. Workload ports are access
+    ports (tag=<vlan>); uplinks to other L2 networks are trunks with an
+    explicit trunks= list. Untagged workload ports are not supported in
+    this mode.
+
+  Snout configures only its own tunnel ports and FDB entries. All other
+  ports belong to the operator.
+
+M2. Configuration (snout.toml, new format, no backward compatibility)
+
+    gobgp_grpc_socket    = "127.0.0.1:50051"   # default
+    log_level            = "info"              # default
+    syslog_facility      = "local0"            # default
+    bridge_scan_interval = "5s"                # default
+    ovs_poll_interval    = "5s"                # default
+    vtep                 = "172.31.0.11"       # required
+    asn                  = 65000               # required when any default RT is needed
+
+    # flat bridge
+    [[bridge]]
+    name = "br-flat"
+    vni  = 100
+    # rd = "...", route_target = "..."         optional
+
+    # VLAN-aware bridge
+    [[bridge]]
+    name       = "br0"
+    vni_offset = 10000                         # VNI = VLAN + offset
+    vlans      = [100, 200, "300-310"]         # active VLANs, values and ranges
+      [[bridge.vni]]                           # optional, only for exceptions
+      vlan = 200
+      vni  = 5000
+      # rd = "...", route_target = "..."
+
+  Rules:
+  - A bridge with `vni` is flat. `vni` cannot be combined with `vni_offset`,
+    `vlans` or [[bridge.vni]].
+  - Active VLANs (VLAN-aware) = union of `vlans` and the VLANs of
+    [[bridge.vni]] entries. [[bridge.vni]] is needed only for exceptions:
+    a VNI outside the offset rule, a custom RD/RT, or activating a VLAN not
+    listed in `vlans`.
+  - VLAN -> VNI: explicit [[bridge.vni]] entry, otherwise vlan + vni_offset.
+    A VLAN in `vlans` without `vni_offset` is an error.
+  - VNI -> VLAN (remote routes): explicit entry first, then vni - vni_offset
+    if that VLAN is active; otherwise the route is ignored.
+  - RD default: <vtep>:<vlan> (VLAN-aware), <vtep>:<vni> (flat; VNI > 65535
+    requires an explicit `rd`).
+  - RT default: <asn>:<vni>. If asn > 65535, every VNI needs an explicit
+    `route_target`, so offset-only VLANs are invalid in that case.
+  - RD/RT overrides are possible only on a flat bridge or on a
+    [[bridge.vni]] entry.
+
+  Validation (any failure stops startup with an error naming the field):
+  - `vtep` is a valid IP; at least one bridge is configured;
+  - bridge names are unique; each bridge is in exactly one valid mode;
+  - VLANs are 1-4094, ranges are well-formed, a VLAN is unique per bridge;
+  - every resulting VNI is 1-16777215 and unique across all bridges,
+    including collisions between calculated and explicit VNIs;
+  - RDs are well-formed and unique on the host (a collision asks for an
+    explicit `rd`); RTs are well-formed.
+
+  Removed: bridge_list, --bridge-list, all SNOUT_* environment variables
+  (SNOUT_OVS_POLL_INTERVAL becomes ovs_poll_interval).
+  Kept CLI options: -c, -f, -h, -v, --gobgp-grpc-socket, --log-level,
+  --syslog-facility, --bridge-scan-interval.
+
+M3. Tunnel ports
+
+  - One port per (bridge, VNI, remote VTEP): sn-<hash(VNI/VTEP)>,
+    type=vxlan, options:remote_ip, options:key=<VNI>, Port protected=true;
+    markers snout-owned, snout-vni, snout-vtep, plus snout-vlan in
+    VLAN-aware mode.
+  - VLAN-aware mode: additionally tag=<vlan>, vlan_mode=access.
+    Flat mode: no tag.
+  - When adopting an existing owned port, Snout corrects remote_ip, key,
+    tag and vlan_mode.
+  - On bridge activation, owned ports whose VNI is not active on that
+    bridge are deleted.
+
+M4. Remote FDB
+
+  - fdb/add <br> <port> <vlan> <mac> and fdb/del <br> <vlan> <mac> with the
+    mapped VLAN (0 in flat mode) everywhere, including ClearRemoteState.
+  - Remote state is keyed by (VNI, MAC).
+
+M5. Local MACs
+
+  - LocalMACs returns (port, VLAN, MAC).
+  - VLAN-aware: VNI from the VLAN map. Flat: the bridge VNI for VLAN 0
+    entries.
+  - Entries on inactive VLANs, on LOCAL and on VXLAN ports are skipped.
+  - Monitor state is keyed by (VNI, MAC).
+
+M6. Publisher
+
+  - RD and RT are taken per route from the settings of its VNI.
+  - The global SetPublisherConfig route target is removed.
+
+M7. Manager
+
+  - A remote Type-2/Type-3 route is applied only to the bridge and VLAN
+    that own its VNI. Unknown VNIs and routes from the own VTEP are ignored.
+  - Bridge appears: announce Type-3 for each active VNI, replay stored
+    remote routes.
+  - Bridge disappears: withdraw its local Type-2/Type-3 routes, stop
+    programming it.
+  - Shutdown: withdraw all local Type-2, then all local Type-3, then clean
+    every bridge.
+  - Errors on one bridge or VNI are logged and do not affect the others.
+
+M8. Tests and docs
+
+  - Unit tests for:
+      config: both modes, mutual exclusion, offset, explicit entries
+      winning, ranges, VNI and RD collisions, RD/RT defaults, 4-byte ASN
+      rules;
+      exact ovs-vsctl / ovs-appctl commands in both modes;
+      port adoption/correction and stale-port cleanup;
+      VLAN<->VNI lookup in both directions;
+      the same MAC in two VNIs; the same VTEP in two VNIs;
+      per-VNI routing in the manager;
+      per-VNI route target in the publisher.
+  - Update README.md, docs/minimal-bum.md, snout.toml.example.
+  - Add to TODO.md: "derive active VLANs from OVS access ports (reusing
+    vni_offset)".
+
+
+C. LAB - COMMON TO ALL SCRIPTS
+------------------------------
+
+C1. Bash, set -Eeuo pipefail, --help, no shellcheck warnings.
+C2. Root only; AlmaLinux 10 or Oracle Linux 10 only.
+C3. All input is validated before any change; errors name the variable;
+    exit code != 0.
+C4. Idempotent: a re-run converges to the same state.
+C5. Topology variables are environment-only; other parameters work both as
+    CLI options and as environment variables.
+C6. firewalld is stopped, disabled and masked.
+C7. User QA with "NOPASSWD: ALL" in /etc/sudoers.d/ (checked with visudo);
+    optional password and/or SSH key.
+C8. GoBGP from GitHub releases (latest or pinned), checksum verified,
+    installed to /usr/local/bin; gobgpd.service runs as user gobgpd with
+    gRPC on 127.0.0.1:50051 only.
+C9. Lab underlay on a dedicated vNIC (UPLINK_IF) via nmcli: static
+    ADDRESS, no gateway, no DNS, ipv4.never-default=yes, IPv6 disabled,
+    autoconnect. The management NIC and the default route are never
+    modified. All downloads use the management NIC.
+
+
+H. bootstrap-hypervisor.sh
+--------------------------
+
+Inputs:
+
+  Name                                Required    Default
+  ----------------------------------  ----------  -------------------------------
+  NEIGH1_IP, NEIGH2_IP, RR_IP         yes, env    -
+  UPLINK_IF                           yes         - (lab vNIC)
+  ADDRESS                             yes         - (172.31.0.x/24)
+  SEGMENTS                            no, env     100,200 (items: vlan | vlan:vni)
+  VNI_OFFSET                          no, env     10000
+  OVERLAY_<vlan>                      no, env     10.<vlan>.0.<last underlay
+                                                  octet>/24 for VLAN <= 255;
+                                                  "none" disables
+  TRUNK_IF                            no, env     -
+  HOST_NAME                           no          -
+  BRIDGE, OVERLAY_MTU                 no          br0, 1450
+  ASN, GOBGP_VERSION                  no          65000, latest
+  QA_USER, QA_PASSWORD, QA_SSH_KEY    no          QA, -, -
+  SNOUT_REPO, SNOUT_REF               no          see U1
+
+Steps:
+
+H1.  Validation: neighbour/RR IPs are valid IPv4, unique, not this host's
+     address and inside the ADDRESS subnet; UPLINK_IF exists and is not the
+     NIC of the default route; SEGMENTS well-formed, VLANs 1-4094, no
+     duplicates, resulting VNIs in range and unique; OVERLAY_<vlan> is a
+     CIDR or "none"; TRUNK_IF exists and differs from UPLINK_IF and from
+     the management NIC.
+H2.  Packages: NFV SIG repo (AlmaLinux: centos-release-nfv-openvswitch;
+     Oracle Linux: repo file), openvswitch3.x, NetworkManager-ovs, git,
+     make, golang, curl, tar, iproute, tcpdump; enable openvswitch, restart
+     NetworkManager.
+H3.  GoBGP: C8. Config: AS, router-id = underlay IP, one neighbour RR_IP
+     (iBGP, local-address = underlay IP, l2vpn-evpn); validated with
+     --dry-run where available.
+H4.  Underlay: C9.
+H5.  OVS through NetworkManager:
+       br0: STP off, standalone, no IP on LOCAL;
+       per VLAN an internal port test<vlan> with ovs-port.tag=<vlan>,
+       MTU OVERLAY_MTU, IP OVERLAY_<vlan> (if any);
+       TRUNK_IF (optional) as a port with ovs-port.trunks = SEGMENTS VLANs;
+       no VXLAN ports, no flows.
+H6.  /etc/snout/snout.toml: vtep, asn, one VLAN-aware [[bridge]] with
+     vni_offset = VNI_OFFSET, vlans = plain items, [[bridge.vni]] only for
+     vlan:vni items. An existing different file is backed up to
+     snout.toml.bak first.
+H7.  Start gobgpd; if not active, show the journal and abort.
+H8.  Pre-checks (warnings only): ping NEIGH1_IP, NEIGH2_IP, RR_IP over
+     UPLINK_IF; `ip route get <ip>` must use dev UPLINK_IF and the underlay
+     IP as source.
+H9.  Install Snout: run snout-update.sh from the bootstrap's own directory.
+     On failure the bootstrap still finishes and exits != 0 at the end.
+H10. Post-checks (warnings only, wait up to 30 s): BGP session with RR_IP
+     established; for each VNI, Snout ports to NEIGH1_IP and NEIGH2_IP
+     exist; otherwise report "neighbour not running Snout yet".
+H11. Summary and per-VLAN test commands: gobgp neighbor,
+     gobgp global rib -a evpn, ovs-vsctl show, ovs-appctl fdb/show,
+     adding a fake MAC on a tagged internal port.
+
+Precondition: the GitHub SSH key is in root's ~/.ssh.
+
+
+R. bootstrap-route-reflector.sh
+-------------------------------
+
+R1. Inputs: NEIGH1_IP, NEIGH2_IP, NEIGH3_IP (required, env only, validated
+    as in H1); UPLINK_IF and ADDRESS (required); HOST_NAME, ASN,
+    ROUTER_ID (default underlay IP), CLUSTER_ID (default router-id),
+    GOBGP_VERSION, QA variables (optional).
+R2. Common steps C6-C9.
+R3. GoBGP config: peer group "hypervisors" (iBGP, route-reflector client,
+    cluster-id, l2vpn-evpn); the three neighbours listed explicitly in
+    that group; no dynamic neighbours.
+R4. Start gobgpd; summary (gobgp neighbor, gobgp global rib -a evpn).
+
+
+U. snout-update.sh
+------------------
+
+U1. SNOUT_REPO (default git@github.com:xslonikx/snout.git), SNOUT_REF
+    (default main), SNOUT_SRC_DIR (default /usr/local/src/snout). Clone or
+    fetch + checkout. SSH with StrictHostKeyChecking=accept-new. A clone
+    failure tells to check root's SSH key.
+U2. GOTOOLCHAIN=local; if `go env GOVERSION` is older than the go directive
+    in go.mod, stop and print both versions.
+U3. go test ./... (unless SNOUT_SKIP_TESTS=1), then
+    CGO_ENABLED=0 go build ./cmd/snout into a temp directory. Any failure
+    stops the script before the running service is touched.
+U4. systemctl stop snout -> back up /usr/local/sbin/snout to snout.prev ->
+    install the new binary to /usr/local/sbin/snout (0755) ->
+    systemctl start snout.
+U5. After ~5 s snout must be active; otherwise show the journal, restore
+    snout.prev, start it again, exit != 0.
+U6. Install misc/snout.service from the repo when missing or changed;
+    daemon-reload; enable.
+U7. snout.toml is never written; if /etc/snout/snout.toml is missing, stop
+    with "run the bootstrap first".
+U8. Print old and new commit, plus snout -v.
+
+
+S. misc/snout.service
+---------------------
+
+S1. ExecStart=/usr/local/sbin/snout -f -c /etc/snout/snout.toml
+    (no EnvironmentFile).
+S2. Requires= and After= openvswitch.service gobgpd.service;
+    Wants= and After= network-online.target.
+S3. Restart=on-failure, RestartSec=3, TimeoutStopSec=30, KillSignal=SIGTERM,
+    runs as root.
+
+
+L. misc/lab/*.env
+-----------------
+
+Topology:
+  Underlay 172.31.0.0/24 on a dedicated vNIC, no gateway.
+  RR  172.31.0.10
+  HV1 172.31.0.11
+  HV2 172.31.0.12
+  HV3 172.31.0.13
+  ASN 65000, SEGMENTS=100,200, VNI_OFFSET=10000 -> VNI 10100, 10200.
+  Overlay test IPs (auto): VLAN 100 -> 10.100.0.11-13/24,
+                           VLAN 200 -> 10.200.0.11-13/24.
+
+Files:
+  rr.env       UPLINK_IF, ADDRESS=172.31.0.10/24,
+               NEIGH1_IP=172.31.0.11, NEIGH2_IP=172.31.0.12,
+               NEIGH3_IP=172.31.0.13, ASN=65000
+  hv1.env      UPLINK_IF, ADDRESS=172.31.0.11/24, RR_IP=172.31.0.10,
+               NEIGH1_IP=172.31.0.12, NEIGH2_IP=172.31.0.13, ASN=65000,
+               SEGMENTS=100,200, VNI_OFFSET=10000
+  hv2.env      as hv1 with ADDRESS .12, NEIGH .11/.13
+  hv3.env      as hv1 with ADDRESS .13, NEIGH .11/.12
+
+  UPLINK_IF is left empty in the files and must be set to the name of the
+  lab vNIC; the scripts fail with a clear error otherwise.
+
+Usage:
+  sudo env $(xargs < misc/lab/hv1.env) bash misc/bootstrap-hypervisor.sh
+
+
+ACCEPTANCE
+----------
+
+1. Both bootstraps exit 0 on fresh VMs; missing or invalid topology
+   variables fail immediately and name the variable.
+2. The RR shows 3 established sessions; every HV has 2 Snout ports per VNI
+   with the correct key and tag.
+3. Ping between test100 ports works across all HVs; the same for test200.
+4. A MAC added in VLAN 100 on HV1 appears only in VNI 10100 on HV2/HV3, on
+   VLAN 100; a broadcast in VLAN 100 never reaches VLAN 200.
+5. Deleting the MAC withdraws it everywhere.
+6. With TRUNK_IF, a host behind the trunk on VLAN 100 reaches VLAN 100 on
+   the other HVs.
+7. An update replaces the binary and restarts the service; a broken build
+   or a failed start leaves the old version running.
+8. Re-running any script without input changes changes nothing; the
+   management NIC and the default route are never modified.
+9. All Snout unit tests pass. Flat mode is covered by unit tests; the lab
+   exercises VLAN-aware mode.
+
+
+KNOWN LIMITATIONS (ACCEPTED)
+----------------------------
+
+- Locally learned MACs age out after 300 s and are withdrawn; use fdb/add
+  for persistent fake MACs.
+- Static FDB entries are lost if ovs-vswitchd restarts while Snout keeps
+  running.
+- The MAC of the LOCAL port is not announced.
+- No multihoming: each external L2 segment connects to exactly one HV.
+- Remote routes are matched by VNI (Ethernet Tag) only; the route target
+  is not checked on import.

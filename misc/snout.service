@@ -1,0 +1,18 @@
+[Unit]
+Description=Snout - BGP EVPN and Open vSwitch FDB synchronization
+Documentation=https://github.com/xslonikx/snout
+Requires=openvswitch.service gobgpd.service
+After=openvswitch.service gobgpd.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/snout -f -c /etc/snout/snout.toml
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+# Snout's graceful shutdown (route withdrawal and OVS cleanup) takes up to 15 s.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

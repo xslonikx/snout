@@ -5,11 +5,11 @@ This document defines the minimum behavior required for broadcast, unknown unica
 ## Control plane
 
 1. Snout must support EVPN Type-3 Inclusive Multicast Ethernet Tag (IMET) routes in addition to the existing Type-2 routes.
-2. When a configured OVS bridge becomes active for a VNI, Snout must advertise one local Type-3 route containing the VNI and local VTEP.
+2. When a configured OVS bridge becomes active, Snout must advertise one local Type-3 route per active VNI of that bridge, containing the VNI and local VTEP.
 3. A configured bridge is active when it exists in OVS and the VNI configuration is valid; a pre-existing VXLAN interface is not required. When the bridge disappears, the VNI is disabled, or Snout shuts down normally, Snout must withdraw its local Type-3 route.
 4. Snout must decode remote Type-3 announcements and withdrawals into internal application events. GoBGP protobuf types must remain inside `internal/gobgp`.
 5. A Type-3 route identifies VTEP membership in a VNI. It must not be treated as a MAC route or added to the OVS FDB.
-6. Snout must ignore its own Type-3 routes and routes for VNIs not configured on the local bridge.
+6. Snout must ignore its own Type-3 routes and routes for VNIs not configured on any local bridge. A route for a configured VNI is applied only to the bridge and VLAN that own that VNI.
 7. Type-2 and Type-3 state must be maintained independently:
    - Type-2: `(VNI, MAC) -> remote VTEP`;
    - Type-3: `VNI -> set of remote VTEPs`.
@@ -24,8 +24,10 @@ This document defines the minimum behavior required for broadcast, unknown unica
    options:key=<VNI>
    ```
 
+   On a VLAN-aware bridge the port is additionally an access port of the VLAN mapped to the VNI (`tag=<vlan>`, `vlan_mode=access`), so OVS strips the tag on encapsulation and adds it on decapsulation. On a flat bridge the port is untagged.
+
 2. The port must exist even when no Type-2 MAC route has been received from that VTEP. This supplies the replication target needed for ARP, IPv6 ND, DHCP, unknown unicast, and multicast.
-3. Every port created by Snout must carry `external_ids:snout-owned=true`, `external_ids:snout-vni=<VNI>`, and `external_ids:snout-vtep=<remote VTEP>`. User-created VXLAN ports must not be changed or deleted.
+3. Every port created by Snout must carry `external_ids:snout-owned=true`, `external_ids:snout-vni=<VNI>`, and `external_ids:snout-vtep=<remote VTEP>` (plus `external_ids:snout-vlan=<VLAN>` on a VLAN-aware bridge). User-created VXLAN ports must not be changed or deleted.
 4. All Type-2 routes for the same `(bridge, VNI, remote VTEP)` must reuse that port.
 5. A Type-3 withdrawal must remove the remote VTEP from the VNI flood list. The VXLAN port may be deleted only after both conditions are true:
    - the Type-3 membership is absent;
@@ -40,7 +42,7 @@ This document defines the minimum behavior required for broadcast, unknown unica
    - each remote VTEP present in the Type-3 flood list for the VNI.
 2. BUM traffic received from a VXLAN port must be delivered only to eligible local workload ports.
 3. A frame received from one VXLAN port must never be forwarded to another VXLAN port. This split-horizon rule is mandatory to prevent loops and repeated replication.
-4. Replication must remain within the same VNI/broadcast domain. Traffic must not leak between VNIs or unrelated bridges.
+4. Replication must remain within the same VNI/broadcast domain. Traffic must not leak between VNIs or unrelated bridges. On a VLAN-aware bridge this is guaranteed by OVS `NORMAL` switching, which floods per VLAN, and by mapping each VNI to exactly one VLAN.
 5. The minimal implementation uses ingress/head-end replication. It must not depend on multicast support in the underlay.
 
 ## Multicast scope

@@ -3,9 +3,11 @@ package ovs
 import (
 	"context"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/xslonikx/snout/internal/event"
+	"github.com/xslonikx/snout/internal/evpn"
 	"github.com/xslonikx/snout/internal/logging"
 )
 
@@ -16,19 +18,39 @@ type Announcer interface {
 	WithdrawIMET(context.Context, event.IMETRoute) error
 }
 
+// MonitorConfig holds the settings shared by all bridges.
 type MonitorConfig struct {
-	RD       string
-	VNI      uint32
 	VTEP     string
 	Interval time.Duration
 }
 
-func MonitorLocalMACs(ctx context.Context, ovs OpenVSwitch, announcer Announcer, config MonitorConfig) error {
+// localRoute builds the Type-2 route for a local FDB entry. ok is false when
+// the entry's VLAN is not an active segment of the bridge.
+func localRoute(bridge evpn.Bridge, vtep string, entry FDBEntry) (event.EVPNRoute, bool) {
+	segment, ok := bridge.SegmentByVLAN(entry.VLAN)
+	if !ok {
+		return event.EVPNRoute{}, false
+	}
+	return event.EVPNRoute{RD: segment.RD, VNI: segment.VNI, MAC: entry.MAC, VTEP: vtep, RouteTarget: segment.RouteTarget}, true
+}
+
+// localIMETRoute builds the Type-3 route of one local segment.
+func localIMETRoute(segment evpn.Segment, vtep string) event.IMETRoute {
+	return event.IMETRoute{RD: segment.RD, VNI: segment.VNI, VTEP: vtep, RouteTarget: segment.RouteTarget}
+}
+
+// MonitorLocalMACs polls the bridge FDB and announces or withdraws one Type-2
+// route per (VNI, MAC). Entries on VLANs that are not active on the bridge
+// are ignored.
+func MonitorLocalMACs(ctx context.Context, ovs OpenVSwitch, announcer Announcer, bridge evpn.Bridge, config MonitorConfig) error {
 	if ovs == nil || announcer == nil {
 		return fmt.Errorf("OVS and announcer are required")
 	}
-	if config.RD == "" || config.VNI == 0 || config.VTEP == "" {
-		return fmt.Errorf("RD, VNI, and VTEP are required")
+	if net.ParseIP(config.VTEP) == nil {
+		return fmt.Errorf("a valid VTEP is required")
+	}
+	if len(bridge.Segments) == 0 {
+		return fmt.Errorf("bridge %q has no active VNI", bridge.Name)
 	}
 	if config.Interval <= 0 {
 		return fmt.Errorf("monitor interval must be positive")
@@ -44,26 +66,30 @@ func MonitorLocalMACs(ctx context.Context, ovs OpenVSwitch, announcer Announcer,
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			logging.Errorf("read local OVS FDB: %v", err)
+			logging.Errorf("read local OVS FDB on bridge %s: %v", bridge.Name, err)
 		} else {
 			current := make(map[string]event.EVPNRoute, len(entries))
 			for _, entry := range entries {
-				route := event.EVPNRoute{RD: config.RD, VNI: config.VNI, MAC: entry.MAC, VTEP: config.VTEP}
-				current[entry.MAC] = route
-				if _, exists := known[entry.MAC]; !exists {
+				route, ok := localRoute(bridge, config.VTEP, entry)
+				if !ok {
+					continue
+				}
+				key := routeKey(route)
+				current[key] = route
+				if _, exists := known[key]; !exists {
 					if err := announcer.Announce(ctx, route); err != nil {
-						logging.Errorf("announce local MAC %s: %v", entry.MAC, err)
-						delete(current, entry.MAC)
+						logging.Errorf("announce local MAC %s in VNI %d: %v", route.MAC, route.VNI, err)
+						delete(current, key)
 					}
 				}
 			}
-			for mac, route := range known {
-				if _, exists := current[mac]; exists {
+			for key, route := range known {
+				if _, exists := current[key]; exists {
 					continue
 				}
 				if err := announcer.Withdraw(ctx, route); err != nil {
-					logging.Errorf("withdraw local MAC %s: %v", mac, err)
-					current[mac] = route
+					logging.Errorf("withdraw local MAC %s in VNI %d: %v", route.MAC, route.VNI, err)
+					current[key] = route
 				}
 			}
 			known = current

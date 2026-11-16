@@ -9,23 +9,34 @@ import (
 	"time"
 
 	"github.com/xslonikx/snout/internal/event"
+	"github.com/xslonikx/snout/internal/evpn"
 	"github.com/xslonikx/snout/internal/logging"
 )
 
 type managedBridge struct {
 	name   string
+	spec   evpn.Bridge
 	ovs    OpenVSwitch
 	cancel context.CancelFunc
 	done   <-chan struct{}
 }
 
-// Manager activates configured OVS bridges, applies remote EVPN routes, and
-// tracks every local route and OVS object owned by Snout.
+// clientFactory creates the dataplane client of one bridge.
+type clientFactory func(evpn.Bridge, Runner) (OpenVSwitch, error)
+
+func newExecClient(bridge evpn.Bridge, runner Runner) (OpenVSwitch, error) {
+	return NewClient(bridge, runner)
+}
+
+// Manager activates configured OVS bridges, applies remote EVPN routes to the
+// bridge that owns their VNI, and tracks every local route and OVS object
+// owned by Snout.
 type Manager struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
-	bridges      []string
+	topology     evpn.Topology
 	runner       Runner
+	newClient    clientFactory
 	announcer    Announcer
 	monitor      MonitorConfig
 	scanInterval time.Duration
@@ -36,31 +47,32 @@ type Manager struct {
 	imets         map[string]event.IMETRoute
 	states        map[string]bool
 	localRoutes   map[string]event.EVPNRoute
-	localIMET     bool
+	localIMETs    map[uint32]event.IMETRoute
 	stopping      bool
 	shutdownDone  bool
 	shutdownError error
 	waitGroup     sync.WaitGroup
 }
 
-func NewManager(ctx context.Context, bridges []string, runner Runner, announcer Announcer, monitor MonitorConfig, scanInterval time.Duration) (*Manager, error) {
-	if len(bridges) == 0 {
+func NewManager(ctx context.Context, topology evpn.Topology, runner Runner, announcer Announcer, monitor MonitorConfig, scanInterval time.Duration) (*Manager, error) {
+	if len(topology.Bridges) == 0 {
 		return nil, fmt.Errorf("at least one OVS bridge is required")
 	}
 	if runner == nil || announcer == nil {
 		return nil, fmt.Errorf("OVS runner and announcer are required")
 	}
-	if monitor.RD == "" || monitor.VNI == 0 || net.ParseIP(monitor.VTEP) == nil || monitor.Interval <= 0 {
-		return nil, fmt.Errorf("valid RD, VNI, VTEP, and monitor interval are required")
+	if net.ParseIP(monitor.VTEP) == nil || monitor.Interval <= 0 {
+		return nil, fmt.Errorf("valid VTEP and monitor interval are required")
 	}
 	if scanInterval <= 0 {
 		return nil, fmt.Errorf("bridge scan interval must be positive")
 	}
 	applyCtx, cancel := context.WithCancel(ctx)
 	return &Manager{
-		ctx: applyCtx, cancel: cancel, bridges: append([]string(nil), bridges...), runner: runner, announcer: announcer,
+		ctx: applyCtx, cancel: cancel, topology: topology, runner: runner, newClient: newExecClient, announcer: announcer,
 		monitor: monitor, scanInterval: scanInterval, active: make(map[string]managedBridge), routes: make(map[string]event.EVPNRoute),
 		imets: make(map[string]event.IMETRoute), states: make(map[string]bool), localRoutes: make(map[string]event.EVPNRoute),
+		localIMETs: make(map[uint32]event.IMETRoute),
 	}, nil
 }
 
@@ -90,12 +102,27 @@ func (m *Manager) StopAccepting() {
 	m.mu.Unlock()
 }
 
+// owner returns the active client of the bridge that owns vni. known is false
+// when no configured bridge carries the VNI.
+func (m *Manager) ownerLocked(vni uint32) (client OpenVSwitch, known bool) {
+	bridge, _, ok := m.topology.BridgeForVNI(vni)
+	if !ok {
+		return nil, false
+	}
+	return m.active[bridge.Name].ovs, true
+}
+
 func (m *Manager) consumeType2(routeEvent event.RouteEvent) {
-	if sameVTEP(routeEvent.Route.VTEP, m.monitor.VTEP) || routeEvent.Route.VNI != m.monitor.VNI {
+	if sameVTEP(routeEvent.Route.VTEP, m.monitor.VTEP) {
 		return
 	}
 	m.mu.Lock()
 	if m.stopping {
+		m.mu.Unlock()
+		return
+	}
+	client, known := m.ownerLocked(routeEvent.Route.VNI)
+	if !known {
 		m.mu.Unlock()
 		return
 	}
@@ -105,28 +132,33 @@ func (m *Manager) consumeType2(routeEvent event.RouteEvent) {
 	} else if routeEvent.Action == event.RouteAdd {
 		m.routes[key] = routeEvent.Route
 	}
-	clients := m.activeClientsLocked()
 	m.mu.Unlock()
-	for _, client := range clients {
-		var err error
-		switch routeEvent.Action {
-		case event.RouteAdd:
-			err = client.AddRemoteMAC(m.ctx, routeEvent.Route)
-		case event.RouteDelete:
-			err = client.DeleteRemoteMAC(m.ctx, routeEvent.Route)
-		}
-		if err != nil {
-			logging.Errorf("apply EVPN route to OVS: %v", err)
-		}
+	if client == nil {
+		return
+	}
+	var err error
+	switch routeEvent.Action {
+	case event.RouteAdd:
+		err = client.AddRemoteMAC(m.ctx, routeEvent.Route)
+	case event.RouteDelete:
+		err = client.DeleteRemoteMAC(m.ctx, routeEvent.Route)
+	}
+	if err != nil {
+		logging.Errorf("apply EVPN route to OVS: %v", err)
 	}
 }
 
 func (m *Manager) consumeType3(imetEvent event.IMETEvent) {
-	if sameVTEP(imetEvent.Route.VTEP, m.monitor.VTEP) || imetEvent.Route.VNI != m.monitor.VNI {
+	if sameVTEP(imetEvent.Route.VTEP, m.monitor.VTEP) {
 		return
 	}
 	m.mu.Lock()
 	if m.stopping {
+		m.mu.Unlock()
+		return
+	}
+	client, known := m.ownerLocked(imetEvent.Route.VNI)
+	if !known {
 		m.mu.Unlock()
 		return
 	}
@@ -136,28 +168,20 @@ func (m *Manager) consumeType3(imetEvent event.IMETEvent) {
 	} else if imetEvent.Action == event.RouteAdd {
 		m.imets[key] = imetEvent.Route
 	}
-	clients := m.activeClientsLocked()
 	m.mu.Unlock()
-	for _, client := range clients {
-		var err error
-		switch imetEvent.Action {
-		case event.RouteAdd:
-			err = client.AddRemoteVTEP(m.ctx, imetEvent.Route)
-		case event.RouteDelete:
-			err = client.DeleteRemoteVTEP(m.ctx, imetEvent.Route)
-		}
-		if err != nil {
-			logging.Errorf("apply EVPN Type-3 route to OVS: %v", err)
-		}
+	if client == nil {
+		return
 	}
-}
-
-func (m *Manager) activeClientsLocked() []OpenVSwitch {
-	clients := make([]OpenVSwitch, 0, len(m.active))
-	for _, bridge := range m.active {
-		clients = append(clients, bridge.ovs)
+	var err error
+	switch imetEvent.Action {
+	case event.RouteAdd:
+		err = client.AddRemoteVTEP(m.ctx, imetEvent.Route)
+	case event.RouteDelete:
+		err = client.DeleteRemoteVTEP(m.ctx, imetEvent.Route)
 	}
-	return clients
+	if err != nil {
+		logging.Errorf("apply EVPN Type-3 route to OVS: %v", err)
+	}
 }
 
 func sameVTEP(left, right string) bool {
@@ -181,47 +205,64 @@ func (m *Manager) Run(ctx context.Context) error {
 }
 
 func (m *Manager) scan(ctx context.Context) {
-	for _, bridge := range m.bridges {
-		client, err := NewClient(bridge, m.runner)
+	for _, bridge := range m.topology.Bridges {
+		client, err := m.newClient(bridge, m.runner)
 		if err != nil {
-			logging.Errorf("create OVS client for bridge %s: %v", bridge, err)
+			logging.Errorf("create OVS client for bridge %s: %v", bridge.Name, err)
 			continue
 		}
 		exists, err := client.BridgeExists(ctx)
 		if err != nil {
-			logging.Errorf("inspect OVS bridge %s: %v", bridge, err)
+			logging.Errorf("inspect OVS bridge %s: %v", bridge.Name, err)
 			continue
 		}
 		m.mu.Lock()
-		previous, known := m.states[bridge]
-		m.states[bridge] = exists
+		previous, known := m.states[bridge.Name]
+		m.states[bridge.Name] = exists
 		m.mu.Unlock()
 		if !known || previous != exists {
 			if exists {
-				logging.Infof("OVS bridge %s exists; VNI %d synchronization is enabled", bridge, m.monitor.VNI)
+				logging.Infof("OVS bridge %s exists; synchronization of %d VNI(s) is enabled", bridge.Name, len(bridge.Segments))
 			} else {
-				logging.Infof("OVS bridge %s does not exist; bridge is ignored", bridge)
+				logging.Infof("OVS bridge %s does not exist; bridge is ignored", bridge.Name)
 			}
 		}
 		if exists {
 			m.activate(ctx, bridge, client)
 		} else {
-			m.deactivate(bridge)
+			m.deactivate(bridge.Name)
 		}
 	}
 }
 
-func (m *Manager) activate(ctx context.Context, name string, client OpenVSwitch) {
+// announceBridgeIMET announces the local Type-3 route of every segment of the
+// bridge. Already announced routes are skipped, so failed announcements are
+// retried on the next scan without affecting the other segments.
+func (m *Manager) announceBridgeIMET(ctx context.Context, bridge evpn.Bridge) {
+	for _, segment := range bridge.Segments {
+		if err := m.AnnounceIMET(ctx, localIMETRoute(segment, m.monitor.VTEP)); err != nil && !errors.Is(err, context.Canceled) {
+			logging.Errorf("announce local EVPN Type-3 route for VNI %d on bridge %s: %v", segment.VNI, bridge.Name, err)
+		}
+	}
+}
+
+func (m *Manager) activate(ctx context.Context, bridge evpn.Bridge, client OpenVSwitch) {
 	m.mu.Lock()
-	if m.stopping || m.active[name].ovs != nil {
+	if m.stopping {
 		m.mu.Unlock()
 		return
 	}
-	m.mu.Unlock()
-	if err := m.AnnounceIMET(ctx, event.IMETRoute{RD: m.monitor.RD, VNI: m.monitor.VNI, VTEP: m.monitor.VTEP}); err != nil {
-		logging.Errorf("announce local EVPN Type-3 route for bridge %s: %v", name, err)
+	if m.active[bridge.Name].ovs != nil {
+		m.mu.Unlock()
+		m.announceBridgeIMET(ctx, bridge)
 		return
 	}
+	m.mu.Unlock()
+
+	if err := client.RemoveStalePorts(ctx); err != nil {
+		logging.Errorf("remove stale VXLAN ports on bridge %s: %v", bridge.Name, err)
+	}
+	m.announceBridgeIMET(ctx, bridge)
 
 	m.mu.Lock()
 	if m.stopping {
@@ -230,33 +271,37 @@ func (m *Manager) activate(ctx context.Context, name string, client OpenVSwitch)
 	}
 	monitorCtx, cancel := context.WithCancel(m.ctx)
 	done := make(chan struct{})
-	m.active[name] = managedBridge{name: name, ovs: client, cancel: cancel, done: done}
-	routes := make([]event.EVPNRoute, 0, len(m.routes))
+	m.active[bridge.Name] = managedBridge{name: bridge.Name, spec: bridge, ovs: client, cancel: cancel, done: done}
+	var routes []event.EVPNRoute
 	for _, route := range m.routes {
-		routes = append(routes, route)
+		if _, ok := bridge.SegmentByVNI(route.VNI); ok {
+			routes = append(routes, route)
+		}
 	}
-	imets := make([]event.IMETRoute, 0, len(m.imets))
+	var imets []event.IMETRoute
 	for _, imet := range m.imets {
-		imets = append(imets, imet)
+		if _, ok := bridge.SegmentByVNI(imet.VNI); ok {
+			imets = append(imets, imet)
+		}
 	}
 	m.waitGroup.Add(1)
 	m.mu.Unlock()
 
 	for _, imet := range imets {
 		if err := client.AddRemoteVTEP(ctx, imet); err != nil {
-			logging.Errorf("restore EVPN Type-3 route on OVS bridge %s: %v", name, err)
+			logging.Errorf("restore EVPN Type-3 route on OVS bridge %s: %v", bridge.Name, err)
 		}
 	}
 	for _, route := range routes {
 		if err := client.AddRemoteMAC(ctx, route); err != nil {
-			logging.Errorf("restore EVPN route on OVS bridge %s: %v", name, err)
+			logging.Errorf("restore EVPN route on OVS bridge %s: %v", bridge.Name, err)
 		}
 	}
 	go func() {
 		defer m.waitGroup.Done()
 		defer close(done)
-		if err := MonitorLocalMACs(monitorCtx, client, m, m.monitor); err != nil && monitorCtx.Err() == nil {
-			logging.Errorf("monitor OVS bridge %s: %v", name, err)
+		if err := MonitorLocalMACs(monitorCtx, client, m, bridge, m.monitor); err != nil && monitorCtx.Err() == nil {
+			logging.Errorf("monitor OVS bridge %s: %v", bridge.Name, err)
 		}
 	}()
 }
@@ -267,7 +312,6 @@ func (m *Manager) deactivate(name string) {
 	if exists {
 		delete(m.active, name)
 	}
-	last := len(m.active) == 0
 	m.mu.Unlock()
 	if !exists {
 		return
@@ -276,17 +320,24 @@ func (m *Manager) deactivate(name string) {
 	<-bridge.done
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if last {
-		if err := m.withdrawLocalRoutes(ctx); err != nil {
-			logging.Errorf("withdraw local EVPN Type-2 routes: %v", err)
-		}
-		if err := m.withdrawLocalIMET(ctx); err != nil {
-			logging.Errorf("withdraw local EVPN Type-3 route: %v", err)
-		}
+	vnis := bridgeVNIs(bridge.spec)
+	if err := m.withdrawLocalRoutes(ctx, vnis); err != nil {
+		logging.Errorf("withdraw local EVPN Type-2 routes of bridge %s: %v", name, err)
+	}
+	if err := m.withdrawLocalIMET(ctx, vnis); err != nil {
+		logging.Errorf("withdraw local EVPN Type-3 routes of bridge %s: %v", name, err)
 	}
 	if err := bridge.ovs.ClearRemoteState(ctx); err != nil {
 		logging.Errorf("clear remote OVS state on bridge %s: %v", name, err)
 	}
+}
+
+func bridgeVNIs(bridge evpn.Bridge) map[uint32]struct{} {
+	vnis := make(map[uint32]struct{}, len(bridge.Segments))
+	for _, segment := range bridge.Segments {
+		vnis[segment.VNI] = struct{}{}
+	}
+	return vnis
 }
 
 func (m *Manager) Announce(ctx context.Context, route event.EVPNRoute) error {
@@ -322,51 +373,67 @@ func (m *Manager) AnnounceIMET(ctx context.Context, route event.IMETRoute) error
 	if m.stopping {
 		return context.Canceled
 	}
-	if m.localIMET {
+	if _, exists := m.localIMETs[route.VNI]; exists {
 		return nil
 	}
 	if err := m.announcer.AnnounceIMET(ctx, route); err != nil {
 		return err
 	}
-	m.localIMET = true
+	m.localIMETs[route.VNI] = route
 	return nil
 }
 
 func (m *Manager) WithdrawIMET(ctx context.Context, route event.IMETRoute) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.localIMET {
+	if _, exists := m.localIMETs[route.VNI]; !exists {
 		return nil
 	}
 	if err := m.announcer.WithdrawIMET(ctx, route); err != nil {
 		return err
 	}
-	m.localIMET = false
+	delete(m.localIMETs, route.VNI)
 	return nil
 }
 
-func (m *Manager) withdrawLocalRoutes(ctx context.Context) error {
+// withdrawLocalRoutes withdraws local Type-2 routes; a nil vnis withdraws
+// all of them.
+func (m *Manager) withdrawLocalRoutes(ctx context.Context, vnis map[uint32]struct{}) error {
 	m.mu.Lock()
 	routes := make([]event.EVPNRoute, 0, len(m.localRoutes))
 	for _, route := range m.localRoutes {
-		routes = append(routes, route)
+		if _, selected := vnis[route.VNI]; vnis == nil || selected {
+			routes = append(routes, route)
+		}
 	}
 	m.mu.Unlock()
 	var errs []error
 	for _, route := range routes {
 		if err := m.Withdraw(ctx, route); err != nil {
-			errs = append(errs, fmt.Errorf("withdraw local MAC %s: %w", route.MAC, err))
+			errs = append(errs, fmt.Errorf("withdraw local MAC %s in VNI %d: %w", route.MAC, route.VNI, err))
 		}
 	}
 	return errors.Join(errs...)
 }
 
-func (m *Manager) withdrawLocalIMET(ctx context.Context) error {
-	route := event.IMETRoute{RD: m.monitor.RD, VNI: m.monitor.VNI, VTEP: m.monitor.VTEP}
-	if err := m.WithdrawIMET(ctx, route); err != nil {
-		return fmt.Errorf("withdraw local EVPN Type-3 route: %w", err)
+// withdrawLocalIMET withdraws local Type-3 routes; a nil vnis withdraws all
+// of them.
+func (m *Manager) withdrawLocalIMET(ctx context.Context, vnis map[uint32]struct{}) error {
+	m.mu.Lock()
+	routes := make([]event.IMETRoute, 0, len(m.localIMETs))
+	for vni, route := range m.localIMETs {
+		if _, selected := vnis[vni]; vnis == nil || selected {
+			routes = append(routes, route)
+		}
 	}
-	return nil
+	m.mu.Unlock()
+	var errs []error
+	for _, route := range routes {
+		if err := m.WithdrawIMET(ctx, route); err != nil {
+			errs = append(errs, fmt.Errorf("withdraw local EVPN Type-3 route for VNI %d: %w", route.VNI, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Shutdown stops event application and local discovery, then withdraws local
@@ -398,10 +465,10 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		errs = append(errs, fmt.Errorf("stop local MAC monitors: %w", ctx.Err()))
 	}
-	if err := m.withdrawLocalRoutes(ctx); err != nil {
+	if err := m.withdrawLocalRoutes(ctx, nil); err != nil {
 		errs = append(errs, err)
 	}
-	if err := m.withdrawLocalIMET(ctx); err != nil {
+	if err := m.withdrawLocalIMET(ctx, nil); err != nil {
 		errs = append(errs, err)
 	}
 	for _, bridge := range bridges {

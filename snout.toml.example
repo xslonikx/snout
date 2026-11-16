@@ -1,5 +1,25 @@
-gobgp_grpc_socket = "127.0.0.1:50051"
-log_level = "info"
-syslog_facility = "local0"
-bridge_list = ["br0"]
+gobgp_grpc_socket    = "127.0.0.1:50051"
+log_level            = "info"
+syslog_facility      = "local0"
 bridge_scan_interval = "5s"
+ovs_poll_interval    = "5s"
+vtep                 = "172.31.0.11"
+asn                  = 65000
+
+# VLAN-aware bridge: VLAN 100 -> VNI 10100, VLAN 200 -> VNI 10200
+[[bridge]]
+name       = "br0"
+vni_offset = 10000
+vlans      = [100, 200]
+
+# Optional exceptions:
+#  [[bridge.vni]]
+#  vlan         = 300
+#  vni          = 5000
+#  rd           = "172.31.0.11:300"
+#  route_target = "65000:777"
+
+# Flat bridge with one VNI and untagged ports:
+#[[bridge]]
+#name = "br-flat"
+#vni  = 100

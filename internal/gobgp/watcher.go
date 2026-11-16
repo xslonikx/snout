@@ -16,11 +16,10 @@ import (
 )
 
 type Client struct {
-	conn            *grpc.ClientConn
-	client          api.GoBgpServiceClient
-	mu              sync.Mutex
-	paths           map[string][]byte
-	publisherConfig PublisherConfig
+	conn   *grpc.ClientConn
+	client api.GoBgpServiceClient
+	mu     sync.Mutex
+	paths  map[string][]byte
 }
 
 func NewClient(address string) (*Client, error) {

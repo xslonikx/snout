@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -22,9 +21,8 @@ import (
 )
 
 const (
-	eventQueueSize      = 128
-	defaultPollInterval = 5 * time.Second
-	shutdownTimeout     = 15 * time.Second
+	eventQueueSize  = 128
+	shutdownTimeout = 15 * time.Second
 )
 
 var errForcedShutdown = errors.New("graceful shutdown interrupted by a repeated signal")
@@ -99,21 +97,19 @@ func runWithSignals(appConfig config.Config, signals <-chan os.Signal, stderr io
 		return closeErr
 	}
 	defer closeBGP()
-	var manager *ovs.Manager
-	if len(appConfig.BridgeList) != 0 {
-		monitorConfig, routeTarget, err := ovsConfigFromEnv()
-		if err != nil {
-			return fmt.Errorf("invalid OVS configuration: %w", err)
-		}
-		if err := bgpClient.SetPublisherConfig(gobgp.PublisherConfig{RouteTarget: routeTarget}); err != nil {
-			return fmt.Errorf("configure GoBGP publisher: %w", err)
-		}
-		manager, err = ovs.NewManager(ctx, appConfig.BridgeList, ovs.ExecRunner{}, bgpClient, monitorConfig, appConfig.BridgeScanInterval)
-		if err != nil {
-			return fmt.Errorf("create OVS manager: %w", err)
-		}
-		bus.AddRouteConsumer(manager)
+	manager, err := ovs.NewManager(ctx, appConfig.Topology, ovs.ExecRunner{}, bgpClient, ovs.MonitorConfig{
+		VTEP:     appConfig.Topology.VTEP,
+		Interval: appConfig.OVSPollInterval,
+	}, appConfig.BridgeScanInterval)
+	if err != nil {
+		return fmt.Errorf("create OVS manager: %w", err)
 	}
+	for _, bridge := range appConfig.Topology.Bridges {
+		for _, segment := range bridge.Segments {
+			logging.Infof("bridge %s: VLAN %d <-> VNI %d (RD %s, RT %s)", bridge.Name, segment.VLAN, segment.VNI, segment.RD, segment.RouteTarget)
+		}
+	}
+	bus.AddRouteConsumer(manager)
 
 	go bus.RunRouteQueue(ctx, routeEvents)
 	go bus.RunIMETQueue(ctx, imetEvents)
@@ -122,37 +118,23 @@ func runWithSignals(appConfig config.Config, signals <-chan os.Signal, stderr io
 	go func() {
 		errs <- bgpClient.Watch(ctx, routeEvents, imetEvents, peerEvents)
 	}()
-	if manager != nil {
-		go func() {
-			errs <- manager.Run(ctx)
-		}()
-	}
+	go func() {
+		errs <- manager.Run(ctx)
+	}()
 
 	select {
 	case received := <-signals:
 		stopWorkers := func() {
-			if manager != nil {
-				manager.StopAccepting()
-			}
+			manager.StopAccepting()
 			cancel()
 		}
-		return handleSignalShutdown(received, signals, stderr, stopWorkers, func(shutdownCtx context.Context) error {
-			if manager == nil {
-				return nil
-			}
-			return manager.Shutdown(shutdownCtx)
-		}, closeBGP, shutdownTimeout)
+		return handleSignalShutdown(received, signals, stderr, stopWorkers, manager.Shutdown, closeBGP, shutdownTimeout)
 	case firstErr := <-errs:
-		if manager != nil {
-			manager.StopAccepting()
-		}
+		manager.StopAccepting()
 		cancel()
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer shutdownCancel()
-		var shutdownErr error
-		if manager != nil {
-			shutdownErr = manager.Shutdown(shutdownCtx)
-		}
+		shutdownErr := manager.Shutdown(shutdownCtx)
 		return errors.Join(workerError(firstErr), shutdownErr, closeBGP())
 	}
 }
@@ -217,28 +199,4 @@ func workerError(errs ...error) error {
 		}
 	}
 	return nil
-}
-
-func ovsConfigFromEnv() (ovs.MonitorConfig, string, error) {
-	vni, err := strconv.ParseUint(os.Getenv("SNOUT_VNI"), 10, 24)
-	if err != nil || vni == 0 {
-		return ovs.MonitorConfig{}, "", errors.New("SNOUT_VNI must be an integer from 1 to 16777215")
-	}
-	interval := defaultPollInterval
-	if value := os.Getenv("SNOUT_OVS_POLL_INTERVAL"); value != "" {
-		interval, err = time.ParseDuration(value)
-		if err != nil || interval <= 0 {
-			return ovs.MonitorConfig{}, "", errors.New("SNOUT_OVS_POLL_INTERVAL must be a positive duration")
-		}
-	}
-	monitorConfig := ovs.MonitorConfig{
-		RD:       os.Getenv("SNOUT_RD"),
-		VNI:      uint32(vni),
-		VTEP:     os.Getenv("SNOUT_VTEP"),
-		Interval: interval,
-	}
-	if monitorConfig.RD == "" || monitorConfig.VTEP == "" || os.Getenv("SNOUT_ROUTE_TARGET") == "" {
-		return ovs.MonitorConfig{}, "", errors.New("SNOUT_RD, SNOUT_ROUTE_TARGET, and SNOUT_VTEP are required")
-	}
-	return monitorConfig, os.Getenv("SNOUT_ROUTE_TARGET"), nil
 }

@@ -13,12 +13,15 @@ const (
 )
 
 // EVPNRoute is the internal representation of an EVPN Type-2 route.
+// RouteTarget is set on locally originated routes; it is empty for routes
+// received from GoBGP.
 type EVPNRoute struct {
-	RD   string `json:"rd"`
-	VNI  uint32 `json:"vni"`
-	MAC  string `json:"mac"`
-	IP   string `json:"ip,omitempty"`
-	VTEP string `json:"vtep"`
+	RD          string `json:"rd"`
+	VNI         uint32 `json:"vni"`
+	MAC         string `json:"mac"`
+	IP          string `json:"ip,omitempty"`
+	VTEP        string `json:"vtep"`
+	RouteTarget string `json:"route_target,omitempty"`
 }
 
 type RouteEvent struct {
@@ -27,10 +30,13 @@ type RouteEvent struct {
 }
 
 // IMETRoute represents EVPN Type-3 membership of a VTEP in a VNI.
+// RouteTarget is set on locally originated routes; it is empty for routes
+// received from GoBGP.
 type IMETRoute struct {
-	RD   string `json:"rd"`
-	VNI  uint32 `json:"vni"`
-	VTEP string `json:"vtep"`
+	RD          string `json:"rd"`
+	VNI         uint32 `json:"vni"`
+	VTEP        string `json:"vtep"`
+	RouteTarget string `json:"route_target,omitempty"`
 }
 
 type IMETEvent struct {
